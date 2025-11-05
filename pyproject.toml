@@ -1,0 +1,18 @@
+[project]
+name = "aigeology_kit"
+version = "0.1.0"
+description = "aigeology-kit utilities"
+requires-python = ">=3.10"
+dependencies = []
+readme = "README.md"
+authors = [{name = "Tatsuya Nagaoka"}]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E","F","I","UP","B"]  # 最小のlintセット
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
