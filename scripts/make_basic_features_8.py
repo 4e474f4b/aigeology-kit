@@ -21,7 +21,123 @@
 
 R, Ropen は複数指定可（例: 2,5,10）。
 
-方針:
+--------------------------------------------------
+[計算スケールと近傍の扱い]
+--------------------------------------------------
+
+DEM を z[i,j]、ピクセルサイズ（解像度）を px [m] とする。
+
+1) ユーザー指定の距離 r [m] → ピクセル数 k への変換
+
+  k = round(r / px)
+  ・k < 1 のときは 1 に切り上げ
+  ・計算窓は中央画素を持つ奇数サイズに調整
+      → 必要なら k を k+1 にして、k×k 窓とする
+
+  例:
+    - 1 m DEM で r=2 → k=3 → 3×3 窓
+    - 1 m DEM で r=5 → k=5 → 5×5 窓
+    - 0.5 m DEM で r=3 → round(3/0.5)=6 → 7×7 窓
+
+  ※ ユーザーが「奇数」を意識する必要はなく、
+     物理距離 r[m] を指定すれば、解像度 px[m] に応じて
+     自動的に最寄りの k×k 窓にマッピングされる。
+
+2) 比高 (relief_r{R}m)
+
+  k×k 窓 W(i,j) 内での局所最大値 − 最小値:
+
+    relief(i,j) = max_{(u,v)∈W} z[u,v] − min_{(u,v)∈W} z[u,v]
+
+3) 標準偏差 (stddev_r{R}m)
+
+  同じく k×k 窓 W(i,j) 内での標本標準偏差:
+
+    μ(i,j)   = (1 / n) Σ_{(u,v)∈W} z[u,v]
+    σ(i,j)   = sqrt( (1 / n) Σ_{(u,v)∈W} (z[u,v] − μ)^2 )
+
+  （実装上は NaN を除外しつつ局所平均・分散を求めている）
+
+4) 勾配角 (slope_deg)
+
+  Horn (1981) 型の 3×3 オペレータで 8 近傍から
+  x, y 方向勾配 (p = ∂z/∂x, q = ∂z/∂y) を求め:
+
+    p ≒ (1 / (8 px)) * Σ kx[m,n] · z[i+m, j+n]
+    q ≒ (1 / (8 px)) * Σ ky[m,n] · z[i+m, j+n]
+
+  勾配角 θ[deg] は
+
+    θ = atan( sqrt(p^2 + q^2) ) * 180 / π
+
+  物理的スケールとしては「DEM 解像度 px の 1〜√2 ピクセル程度」
+  の局所的な傾きに相当する。
+
+5) 斜面方位 (aspect_deg)
+
+  同じ p, q を用いて、斜面方位 α[deg] を
+
+    α = atan2(q, p) * 180 / π
+    （0° = 東, 90° = 北, 反時計回り）
+
+  として定義している。
+
+6) ラプラシアン (laplacian)
+
+  高さの 2 次微分の和 ∇²z を、8 近傍ラプラシアンカーネル
+
+    ( 1  1  1 )
+    ( 1 -8  1 ) / px²
+    ( 1  1  1 )
+
+  との畳み込みで近似:
+
+    ∇²z(i,j) ≒ (1 / px²) * Σ k_lap[m,n] · z[i+m, j+n]
+
+7) 平均曲率 (mean_curvature)
+
+  numpy.gradient による 1 ピクセル差分で
+  p = z_x, q = z_y, z_xx, z_yy, z_xy を求め、
+
+    H = { (1+q²) z_xx − 2 p q z_xy + (1+p²) z_yy }
+        / { 2 (1 + p² + q²)^{3/2} }
+
+  という簡易な平均曲率（Yokoyama らの地形学でよく使われる定義）を
+  各画素に対して計算する。スケールは勾配と同様に 1 ピクセル程度。
+
+8) 開度 (openness_pos / openness_neg)
+
+  ユーザーが指定した r_open [m] を px からピクセル数に換算し、
+  最大ステップ数 max_step = round(r_open / px) を定める。
+
+  各画素 (i,j) について、n_dirs 本の方向ベクトル d_k（0〜π の半円上）を
+  用意し、各方向 k ごとに s = 1〜max_step の離れたセルを走査:
+
+    ・上向き仰角:
+        φ_up(k,s) = atan( (z_s − z_0) / dist_s )
+
+    ・下向き俯角:
+        φ_dn(k,s) = atan( (z_0 − z_s) / dist_s )
+
+    ここで dist_s は (i,j) からそのセルまでの水平距離[m]。
+
+  方向ごとの最大仰角/俯角を
+
+    φ_up_max(k) = max_s φ_up(k,s)
+    φ_dn_max(k) = max_s φ_dn(k,s)
+
+  とし、方向平均した天頂角から正/負開度を定義:
+
+    正開度 Ω⁺(i,j) = 90° − mean_k( φ_up_max(k) * 180/π )
+    負開度 Ω⁻(i,j) = 90° − mean_k( φ_dn_max(k) * 180/π )
+
+  SAGA 版 (ta_lighting 5) も Python 版も、基本的に
+  「r_open[m] までの範囲」を解像度 px からピクセル数に換算して
+  同様の幾何学的意味を持つ開度を計算する。
+
+--------------------------------------------------
+[方針]
+--------------------------------------------------
   - 近傍が完全に取れない外縁は、すべての特徴量で NODATA に統一。
   - 開度は SAGA (saga_cmd) / Python 内蔵 / スキップ を選択。
 """
@@ -36,7 +152,8 @@ from pathlib import Path
 import numpy as np
 import rasterio
 from rasterio.transform import Affine
-from scipy.ndimage import uniform_filter, maximum_filter, minimum_filter
+from scipy.ndimage import uniform_filter, maximum_filter, minimum_filter, convolve
+
 
 
 # =============== ユーティリティ ===============
@@ -167,31 +284,61 @@ def local_stddev(arr, win_pix: int):
     return out
 
 
+def _horn_gradients(arr, px: float):
+    """
+    Horn (1981) の 3x3 オペレータで 8近傍を使った勾配を計算する。
+    gx: 東向き（+x）方向の上り勾配
+    gy: 北向き（+y）方向の上り勾配
+    """
+    arr = arr.astype(np.float32)
+    mask = ~np.isfinite(arr)
+
+    kx = np.array([[-1, 0, 1],
+                   [-2, 0, 2],
+                   [-1, 0, 1]], dtype=np.float32) / (8.0 * px)
+
+    ky = np.array([[ 1,  2,  1],
+                   [ 0,  0,  0],
+                   [-1, -2, -1]], dtype=np.float32) / (8.0 * px)
+
+    gx = convolve(arr, kx, mode="nearest")
+    gy = convolve(arr, ky, mode="nearest")
+
+    gx[mask] = np.nan
+    gy[mask] = np.nan
+    return gx, gy
+
+
 def slope_deg(arr, px: float):
-    """勾配角 [deg]"""
-    gy, gx = np.gradient(arr, px, px)
+    """勾配角 [deg]（8近傍）"""
+    gx, gy = _horn_gradients(arr, px)
     slope = np.degrees(np.arctan(np.hypot(gx, gy)))
     slope[~np.isfinite(arr)] = np.nan
     return slope.astype(np.float32)
 
 
 def aspect_deg(arr, px: float):
-    """方位角 [deg, 0〜360)"""
-    gy, gx = np.gradient(arr, px, px)
-    aspect = np.degrees(np.arctan2(-gx, gy))  # 北=0, 東=90...
-    aspect = np.mod(aspect, 360.0)
+    """斜面方位 [deg]（0=東, 90=北, 8近傍）"""
+    gx, gy = _horn_gradients(arr, px)
+    # 現状の定義を維持（0=東, 90=北, 反時計回り）
+    aspect = (np.degrees(np.arctan2(gy, gx)) + 360.0) % 360.0
     aspect[~np.isfinite(arr)] = np.nan
     return aspect.astype(np.float32)
 
 
 def laplacian(arr, px: float):
-    """ラプラシアン（2次微分の和）"""
-    gy, gx = np.gradient(arr, px, px)
-    gyy, gyx = np.gradient(gy, px, px)
-    gxy, gxx = np.gradient(gx, px, px)
-    lap = gxx + gyy
-    lap[~np.isfinite(arr)] = np.nan
-    return lap.astype(np.float32)
+    """ラプラシアン ∇²z（8近傍版）"""
+    arr = arr.astype(np.float32)
+    mask = ~np.isfinite(arr)
+
+    # 8近傍ラプラシアンカーネル
+    k_lap = np.array([[1, 1, 1],
+                      [1,-8, 1],
+                      [1, 1, 1]], dtype=np.float32) / (px * px)
+
+    out = convolve(arr, k_lap, mode="nearest").astype(np.float32)
+    out[mask] = np.nan
+    return out
 
 
 def mean_curvature(arr, px: float):
