@@ -309,6 +309,53 @@ def openness_pair(dem: np.ndarray, res: float, radius_m: float,
     neg[nodata_mask] = np.nan
     return pos, neg
 
+# =============== SAGA の開度計算を確認 ===============
+
+def confirm_saga_openness_tool(saga_cmd_path: str, tool_id: int = 5) -> bool:
+    """
+    SAGA の ta_lighting モジュール一覧を表示し、
+    tool_id 番が "Topographic Openness" になっているかを確認する。
+
+    True ならそのまま 5 番を使う。
+    False なら Python 内蔵にフォールバックするなどを呼び出し側で判断。
+    """
+    print("\n[SAGA] ta_lighting モジュールの一覧を確認します...")
+    try:
+        # -h をつけてヘルプを出す（returncode は無視する）
+        res = subprocess.run(
+            [saga_cmd_path, "ta_lighting", "-h"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except Exception as e:
+        print(f"  [ERROR] saga_cmd ta_lighting の実行に失敗しました: {e}")
+        return False
+
+    # ★ returncode は気にしないで、とにかく出力を見に行く
+    text = (res.stdout or "") + "\n" + (res.stderr or "")
+
+    print("  ---- ta_lighting のツール一覧 ----")
+    print(res.stdout)
+
+    expected_label = "Topographic Openness"
+    key = f"[{tool_id}]"     # ← ここを "(5)" ではなく "[5]" に
+    ok = False
+    for line in text.splitlines():
+        if key in line and expected_label in line:
+            ok = True
+            break
+
+    if ok:
+        print(f"  → [{tool_id}] {expected_label} を開度計算に使用します。")
+        ans = input("    この内容で問題なければ Enter（変更したい場合は n）: ").strip().lower()
+        if ans in ("n", "no"):
+            return False
+        return True
+    else:
+        print(f"  [WARN] ta_lighting {tool_id} に '{expected_label}' が見つかりません。")
+        ans = input("    このまま ta_lighting 5 を使うのではなく、Python 内蔵開度に切り替えますか？ [Y/n]: ").strip().lower()
+        return False if ans in ("", "y", "yes") else True
 
 # =============== SAGA で開度 ===============
 
@@ -372,18 +419,29 @@ def compute_openness_with_saga(
             out_tif_path = out_dir / out_tif_name
             with rasterio.open(grid_path) as src_saga:
                 data = src_saga.read(1).astype(np.float32)
+
+                # SAGA 側の NODATA 値（だいたい -99999）
+                saga_nodata = src_saga.nodata
+                if saga_nodata is None:
+                    saga_nodata = -99999.0  # SAGA のデフォルトに合わせる
+
+                # 1) SAGA の NODATA を NaN に
+                data = np.where(data == saga_nodata, np.nan, data)
+
+                # 2) NaN / inf を、このスクリプトで使う nodata に統一
                 data = np.where(np.isfinite(data), data, nodata).astype(np.float32)
+
                 meta2 = meta.copy()
                 meta2.update(
                     width=src_saga.width,
                     height=src_saga.height,
                     transform=src_saga.transform,
                     crs=src_saga.crs,
+                    nodata=nodata,  # 念のためここも明示
                 )
                 with rasterio.open(out_tif_path, "w", **meta2) as dst:
                     dst.write(data, 1)
             print(f"    [OK] {out_tif_path}")
-
         convert_saga_grid_to_gtiff(
             pos_grid,
             f"{stem}_openness_pos_{tag_open}.tif",
@@ -392,7 +450,6 @@ def compute_openness_with_saga(
             neg_grid,
             f"{stem}_openness_neg_{tag_open}.tif",
         )
-
 
 # =============== メイン処理 ===============
 
@@ -437,13 +494,6 @@ def main():
     saga_cmd_path = shutil.which("saga_cmd")
     has_saga = saga_cmd_path is not None
 
-    # 比高・偏差：複数半径
-    relief_r_list = ask_float_list(
-        "比高・偏差の計算範囲 r[m]（カンマ区切り可, 例: 2,5,10)"
-        "\n  例) 1mDEMで r=2 → 3×3窓, r=5 → 11×11窓",
-        [5.0],
-    )
-
     # ------------------------------
     # 開度の計算方法を先に決める
     # ------------------------------
@@ -455,6 +505,14 @@ def main():
         print("  2: Python 内蔵の開度計算を使う（小〜中規模DEM向け）")
         print("  3: 開度は計算しない")
         openness_mode = ask_int("番号を選んでください", 1)
+
+        # ★ SAGA を選んだときだけ ta_lighting 5 を確認する
+        if openness_mode == 1:
+            ok = confirm_saga_openness_tool(saga_cmd_path, tool_id=5)
+            if not ok:
+                print("  → SAGA 開度は使用せず、Python 内蔵開度モードに切り替えます。")
+                openness_mode = 2
+
     else:
         print("  saga_cmd が見つかりませんでした（PATH 未設定 or SAGA 未インストール）。")
         print("  ※ SAGA の開度を使いたい場合は、OS に SAGA をインストールし、`saga_cmd` に PATH を通してください。")
@@ -465,6 +523,13 @@ def main():
             openness_mode = 2  # Python 内蔵
         else:
             openness_mode = 3  # スキップ
+
+    # 比高・偏差：複数半径
+    relief_r_list = ask_float_list(
+        "比高・偏差の計算範囲 r[m]（カンマ区切り可, 例: 2,5,10)"
+        "\n  例) 1mDEMで r=2 → 3×3窓, r=5 → 11×11窓",
+        [5.0],
+    )
 
     # 開度パラメータ（必要なときだけ）
     openness_r_list = []
@@ -600,7 +665,7 @@ def main():
             print("    - 地下開度 (openness_neg) ...")
             write_feature(f"{dem_path.stem}_openness_neg_{tag_open}.tif", neg_m)
 
-    print("\n[DONE] 全 8 指標（マルチスケール）の出力が完了しました。」")
+    print("\n[DONE] 全 8 指標（マルチスケール）の出力が完了しました。")
 
 
 if __name__ == "__main__":
