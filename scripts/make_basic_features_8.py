@@ -94,7 +94,7 @@ def ask_float_list(prompt, default_list):
         if not s:
             return list(default_list)
         try:
-            vals = [float(v) for v in s.split(",") if v.strip() != ""]
+            vals = [float(x) for x in s.split(",") if x.strip() != ""]
             if not vals:
                 raise ValueError
             return vals
@@ -176,35 +176,37 @@ def slope_deg(arr, px: float):
 
 
 def aspect_deg(arr, px: float):
-    """斜面方位 [deg]（0=東, 90=北）"""
+    """方位角 [deg, 0〜360)"""
     gy, gx = np.gradient(arr, px, px)
-    aspect = (np.degrees(np.arctan2(gy, gx)) + 360.0) % 360.0
+    aspect = np.degrees(np.arctan2(-gx, gy))  # 北=0, 東=90...
+    aspect = np.mod(aspect, 360.0)
     aspect[~np.isfinite(arr)] = np.nan
     return aspect.astype(np.float32)
 
 
 def laplacian(arr, px: float):
-    """ラプラシアン ∇²z = z_xx + z_yy"""
-    zy, zx = np.gradient(arr, px, px)      # 1階微分
-    zyy, _ = np.gradient(zy, px, px)
-    _, zxx = np.gradient(zx, px, px)
-    out = (zxx + zyy).astype(np.float32)
-    out[~np.isfinite(arr)] = np.nan
-    return out
+    """ラプラシアン（2次微分の和）"""
+    gy, gx = np.gradient(arr, px, px)
+    gyy, gyx = np.gradient(gy, px, px)
+    gxy, gxx = np.gradient(gx, px, px)
+    lap = gxx + gyy
+    lap[~np.isfinite(arr)] = np.nan
+    return lap.astype(np.float32)
 
 
 def mean_curvature(arr, px: float):
-    """平均曲率 H"""
-    zy, zx = np.gradient(arr, px, px)
-    zyy, _ = np.gradient(zy, px, px)
-    zxy, _ = np.gradient(zx, px, px)
-    _, zxx = np.gradient(zx, px, px)
+    """
+    平均曲率（簡易実装）
+    """
+    gy, gx = np.gradient(arr, px, px)
+    zyy, zyx = np.gradient(gy, px, px)
+    zxy, zxx = np.gradient(gx, px, px)
 
-    denom = 2.0 * np.power(1.0 + zx * zx + zy * zy, 1.5)
-    eps = np.finfo(np.float32).eps
-    denom = np.where(denom < eps, eps, denom)
+    zx2 = gx * gx
+    zy2 = gy * gy
+    denom = 2.0 * np.power(1.0 + zx2 + zy2, 1.5)
 
-    num = (1.0 + zy * zy) * zxx - 2.0 * zx * zy * zxy + (1.0 + zx * zx) * zyy
+    num = (1.0 + zy2) * zxx - 2.0 * gx * gy * zxy + (1.0 + zx2) * zyy
     with np.errstate(invalid="ignore", divide="ignore"):
         H = num / denom
     H[~np.isfinite(arr)] = np.nan
@@ -218,61 +220,93 @@ def _unit_dirs(n_dirs: int):
 
 
 def openness_pair(dem: np.ndarray, res: float, radius_m: float,
-                  n_dirs: int = 16, step_stride: int = 1):
+                  n_dirs: int = 8, step_stride: int = 1):
     """
     地上開度/地下開度を同時に計算（視線角ベースのシンプル版）。
-    大きなDEMに対しては非常に重いので注意。
+
+    定義は Yokoyama et al. (2002) の正/負開度と同じで、
+
+      1. 各方向ごとに、中心点から半径 L までの「最大仰角」を求める
+      2. その仰角を 90° から引いた「天頂角」を求める
+      3. 天頂角を方向平均したものを開度（正/負）とする
+
+    ここでは仰角を直接足し合わせた平均から 90° を引いているだけで、
+    数学的には同等。
     """
+    if radius_m <= 0:
+        raise ValueError("radius_m must be positive")
+
     h, w = dem.shape
-    dxu, dyu = _unit_dirs(n_dirs)
+    nodata_mask = ~np.isfinite(dem)
+
     max_step = max(1, int(radius_m / res))
-    if step_stride < 1:
-        step_stride = 1
+    # step_stride = 1 → 1,2,3,...step_max
+    # step_stride = 2 → 2,4,6,...
+    # step_stride = 3 → 3,6,9,...
+    step_indices = np.arange(1, max_step + 1, step_stride, dtype=int)
+    if step_indices.size == 0:
+        step_indices = np.array([1], dtype=int)
 
-    pos = np.full((h, w), np.nan, dtype=np.float32)
-    neg = np.full((h, w), np.nan, dtype=np.float32)
+    dx_dirs, dy_dirs = _unit_dirs(n_dirs)
 
-    for y in range(h):
-        for x in range(w):
-            z0 = dem[y, x]
-            if np.isnan(z0):
+    pos = np.zeros_like(dem, dtype=np.float32)
+    neg = np.zeros_like(dem, dtype=np.float32)
+
+    for y0 in range(h):
+        for x0 in range(w):
+            z0 = dem[y0, x0]
+            if not np.isfinite(z0):
+                pos[y0, x0] = np.nan
+                neg[y0, x0] = np.nan
                 continue
-            acc_up = 0.0
-            acc_dn = 0.0
-            cnt = 0
-            for k in range(n_dirs):
-                max_alpha_up = -1e9
-                max_alpha_dn = -1e9
-                dxk, dyk = dxu[k], dyu[k]
-                hit = False
-                for s in range(step_stride, max_step + 1, step_stride):
-                    ix = int(round(x + dxk * s))
-                    iy = int(round(y + dyk * s))
-                    if ix < 0 or iy < 0 or ix >= w or iy >= h:
-                        break
-                    z = dem[iy, ix]
-                    if np.isnan(z):
-                        continue
-                    dist = s * res
-                    au = math.atan((z - z0) / dist)
-                    ad = math.atan((z0 - z) / dist)
-                    if au > max_alpha_up:
-                        max_alpha_up = au
-                    if ad > max_alpha_dn:
-                        max_alpha_dn = ad
-                    hit = True
-                if hit:
-                    if max_alpha_up > -1e8:
-                        acc_up += max_alpha_up
-                    if max_alpha_dn > -1e8:
-                        acc_dn += max_alpha_dn
-                    cnt += 1
-            if cnt > 0:
-                mean_up = (acc_up / cnt) * 180.0 / math.pi
-                mean_dn = (acc_dn / cnt) * 180.0 / math.pi
-                pos[y, x] = 90.0 - mean_up
-                neg[y, x] = 90.0 - mean_dn
 
+            max_up = np.zeros(n_dirs, dtype=np.float32) - np.inf
+            max_dn = np.zeros(n_dirs, dtype=np.float32) - np.inf
+
+            for k_dir in range(n_dirs):
+                dx = dx_dirs[k_dir]
+                dy = dy_dirs[k_dir]
+
+                for s in step_indices:
+                    xx = x0 + dx * s
+                    yy = y0 + dy * s
+                    ix = int(round(xx))
+                    iy = int(round(yy))
+                    if ix < 0 or ix >= w or iy < 0 or iy >= h:
+                        continue
+                    z = dem[iy, ix]
+                    if not np.isfinite(z):
+                        continue
+
+                    dist = math.hypot((ix - x0) * res, (iy - y0) * res)
+                    if dist <= 0:
+                        continue
+
+                    au = math.atan((z - z0) / dist)      # 上向き（仰角）
+                    ad = math.atan((z0 - z) / dist)      # 下向き（俯角）
+
+                    if au > max_up[k_dir]:
+                        max_up[k_dir] = au
+                    if ad > max_dn[k_dir]:
+                        max_dn[k_dir] = ad
+
+            finite_up = np.isfinite(max_up)
+            finite_dn = np.isfinite(max_dn)
+
+            if not finite_up.any():
+                pos[y0, x0] = np.nan
+            else:
+                mean_up = float(max_up[finite_up].mean()) * 180.0 / math.pi
+                pos[y0, x0] = 90.0 - mean_up
+
+            if not finite_dn.any():
+                neg[y0, x0] = np.nan
+            else:
+                mean_dn = float(max_dn[finite_dn].mean()) * 180.0 / math.pi
+                neg[y0, x0] = 90.0 - mean_dn
+
+    pos[nodata_mask] = np.nan
+    neg[nodata_mask] = np.nan
     return pos, neg
 
 
@@ -291,6 +325,9 @@ def compute_openness_with_saga(
     """
     SAGA の Tool 'Topographic Openness' (ta_lighting 5) を使って
     正/負開度を計算し、GeoTIFF に書き出す。
+
+    - この関数は外部コマンド `saga_cmd` を subprocess で実行します。
+    - このスクリプトを実行するシェル環境で `saga_cmd` に PATH が通っていることが前提です。
     """
     for r_open in openness_r_list:
         rtag_open = int(round(r_open))
@@ -360,46 +397,33 @@ def compute_openness_with_saga(
 # =============== メイン処理 ===============
 
 def main():
-    print("\n=== DEM → 8特徴量 一括出力（マルチスケール＋SAGA開度対応＋外縁マスク統一） ===")
+    print("=== DEM → 8特徴量 一括出力（マルチスケール＋SAGA開度対応＋外縁マスク統一） ===")
 
-    dem_path_str = ask_path("入力DEM GeoTIFF のパス")
+    dem_path_str = ask_path("入力DEM GeoTIFF のパス", must_exist=True)
     dem_path = Path(dem_path_str)
-    stem = dem_path.stem
 
-    default_out = str(dem_path.with_name(stem + "_features"))
-    out_dir_str = ask_path("出力フォルダ", must_exist=False, default=default_out)
+    default_out_dir = str(dem_path.with_suffix("").parent / (dem_path.stem + "_features"))
+    out_dir_str = ask_path(f"出力フォルダ [{default_out_dir}]", must_exist=False, default=default_out_dir)
     out_dir = Path(out_dir_str)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # DEM 読み込み
     with rasterio.open(dem_path) as src:
         dem = src.read(1).astype(np.float32)
-        transform: Affine = src.transform
-        crs = src.crs
-        px_x = transform.a
-        px_y = -transform.e
-
-        if not np.isfinite(px_x) or not np.isfinite(px_y) or px_x <= 0 or px_y <= 0:
-            print("ERROR: ピクセルサイズが不正です。")
-            sys.exit(1)
-
-        if abs(px_x - px_y) > 1e-6:
-            print(f"[WARN] x/y ピクセルサイズが異なります: {px_x} vs {px_y}")
-        px = float((px_x + px_y) / 2.0)
-
         nodata = src.nodata
         if nodata is None:
-            nodata = -9999.0
-
-        dem = np.where(dem == nodata, np.nan, dem)
-        dem = np.where(np.isfinite(dem), dem, np.nan)
+            nodata = np.nan
+        transform = src.transform
+        if not isinstance(transform, Affine):
+            transform = Affine(*transform)
+        px = transform.a  # assume square pixels
+        # 高さ方向の変換は無視（Z単位は m 前提）
 
         meta = src.meta.copy()
         meta.update(
             dtype="float32",
             nodata=nodata,
-            compress="DEFLATE",
-            predictor=3,
+            compress="lzw",
             tiled=True,
             blockxsize=512,
             blockysize=512,
@@ -415,38 +439,25 @@ def main():
 
     # 比高・偏差：複数半径
     relief_r_list = ask_float_list(
-        "比高・偏差の計算範囲 r[m]（カンマ区切り可, 例: 2,5,10）"
+        "比高・偏差の計算範囲 r[m]（カンマ区切り可, 例: 2,5,10)"
         "\n  例) 1mDEMで r=2 → 3×3窓, r=5 → 11×11窓",
         [5.0],
     )
 
-    # 開度：複数半径（デフォルトは比高と同じ）
-    openness_r_list = ask_float_list(
-        "開度の最大距離 r_open[m]（カンマ区切り可, Enterで比高と同じ）"
-        "\n  例) 1mDEMで r=2 → 1〜2ピクセル先まで, r=10 → 1〜10ピクセル先まで",
-        relief_r_list,
-    )
-
-    n_dirs = ask_int(
-        "開度の方向数 n_dirs（8 or 16 推奨）", 8
-    )
-
-    step_stride = ask_int(
-        "開度のサンプリング間隔（ピクセル）"
-        "\n  1: 1,2,3,...ピクセルごと / 2: 2,4,6,... / 3: 3,6,9,...",
-        1,
-    )
-
-    # 開度計算モード選択
+    # ------------------------------
+    # 開度の計算方法を先に決める
+    # ------------------------------
     print("\n[開度の計算方法]")
     if has_saga:
         print(f"  saga_cmd が見つかりました: {saga_cmd_path}")
+        print("  ※ このスクリプトを実行している環境で `saga_cmd` に PATH が通っていれば、そのまま利用できます。")
         print("  1: SAGA (ta_lighting 5) で開度を計算する（大規模DEM向け推奨）")
         print("  2: Python 内蔵の開度計算を使う（小〜中規模DEM向け）")
         print("  3: 開度は計算しない")
         openness_mode = ask_int("番号を選んでください", 1)
     else:
         print("  saga_cmd が見つかりませんでした（PATH 未設定 or SAGA 未インストール）。")
+        print("  ※ SAGA の開度を使いたい場合は、OS に SAGA をインストールし、`saga_cmd` に PATH を通してください。")
         print("  1: Python 内蔵の開度計算を使う（小〜中規模DEM向け）")
         print("  2: 開度は計算しない")
         openness_mode_raw = ask_int("番号を選んでください", 1)
@@ -454,6 +465,49 @@ def main():
             openness_mode = 2  # Python 内蔵
         else:
             openness_mode = 3  # スキップ
+
+    # 開度パラメータ（必要なときだけ）
+    openness_r_list = []
+    n_dirs = None
+    step_stride = 1
+
+    if openness_mode != 3:
+        # 評価範囲 L (= r_open) は SAGA / Python 共通
+        openness_r_list = ask_float_list(
+            "開度の最大距離 r_open[m]（カンマ区切り可, Enterで比高と同じ）"
+            "\n  例) 1mDEMで r=2 → 1〜2ピクセル先まで, r=10 → 1〜10ピクセル先まで",
+            relief_r_list,
+        )
+
+        n_dirs = ask_int(
+            "開度の方向数 n_dirs（8 or 16 推奨）", 8
+        )
+
+        # サンプリング間隔は Python 内蔵開度のときだけ聞く
+        if openness_mode == 2:
+            step_stride = ask_int(
+                "開度のサンプリング間隔（ピクセル, Python 内蔵のみ）"
+                "\n  1: 1,2,3,...ピクセルごと / 2: 2,4,6,... / 3: 3,6,9,...",
+                1,
+            )
+
+            # どう解釈されるかを明示
+            print("\n  > 開度 (Python 内蔵) の評価設定")
+            for r_open in openness_r_list:
+                n_px = max(1, int(round(float(r_open) / float(px))))
+                print(
+                    f"    - r_open={r_open}m → 1〜{n_px} ピクセル先まで"
+                    f"（stride={step_stride} ピクセル刻み）を評価"
+                )
+        elif openness_mode == 1:
+            # SAGA モードの評価設定も軽く表示
+            print("\n  > 開度 (SAGA ta_lighting 5) の評価設定")
+            for r_open in openness_r_list:
+                n_px = max(1, int(round(float(r_open) / float(px))))
+                print(
+                    f"    - r_open={r_open}m → 1〜{n_px} ピクセル先まで"
+                    f"（n_dirs={n_dirs} 方向）の最大天頂角を平均"
+                )
 
     # Python 内蔵開度でのサイズ警告
     if openness_mode == 2:
@@ -484,35 +538,34 @@ def main():
         relief = local_relief_range(dem, win_pix_rel)
         relief = _apply_valid_mask(relief, win_pix_rel)
         rtag = int(round(r))
-        write_feature(f"{stem}_relief_r{rtag}m.tif", relief)
+        write_feature(f"{dem_path.stem}_relief_r{rtag}m.tif", relief)
 
-        print("    - 偏差 (stddev) ...")
+        print("    - 標準偏差 (stddev) ...")
         stddev = local_stddev(dem, win_pix_rel)
         stddev = _apply_valid_mask(stddev, win_pix_rel)
-        write_feature(f"{stem}_stddev_r{rtag}m.tif", stddev)
+        write_feature(f"{dem_path.stem}_stddev_r{rtag}m.tif", stddev)
 
-    # --- 傾斜・方位・ラプラシアン・平均曲率（単スケール） ---
-    # 勾配・曲率は実質 3×3 近傍で決まるので、外周1ピクセルはNODATAに統一する
-
-    print("\n  > 傾斜 (slope_deg) ...")
+    # --- 勾配・方位 ---
+    print("\n  > 勾配 (slope_deg) ...")
     slope = slope_deg(dem, px)
-    slope = _apply_valid_mask(slope, 3)  # 3×3窓想定 → 外周1ピクセル NaN → NODATA
-    write_feature(f"{stem}_slope_deg.tif", slope)
+    slope = _apply_valid_mask(slope, 3)
+    write_feature(f"{dem_path.stem}_slope_deg.tif", slope)
 
-    print("  > 斜面方位 (aspect_deg) ...")
+    print("  > 方位 (aspect_deg) ...")
     aspect = aspect_deg(dem, px)
     aspect = _apply_valid_mask(aspect, 3)
-    write_feature(f"{stem}_aspect_deg.tif", aspect)
+    write_feature(f"{dem_path.stem}_aspect_deg.tif", aspect)
 
+    # --- ラプラシアン・平均曲率 ---
     print("  > ラプラシアン (laplacian) ...")
     lap = laplacian(dem, px)
     lap = _apply_valid_mask(lap, 3)
-    write_feature(f"{stem}_laplacian.tif", lap)
+    write_feature(f"{dem_path.stem}_laplacian.tif", lap)
 
     print("  > 平均曲率 (mean_curvature) ...")
     meancurv = mean_curvature(dem, px)
     meancurv = _apply_valid_mask(meancurv, 3)
-    write_feature(f"{stem}_mean_curvature.tif", meancurv)
+    write_feature(f"{dem_path.stem}_mean_curvature.tif", meancurv)
 
     # --- 開度（マルチスケール） ---
     if openness_mode == 3:
@@ -523,7 +576,7 @@ def main():
             saga_cmd_path,
             dem_path,
             out_dir,
-            stem,
+            dem_path.stem,
             openness_r_list,
             n_dirs,
             nodata,
@@ -543,11 +596,11 @@ def main():
             tag_open = f"r{rtag_open}m_nd{n_dirs}dir"
 
             print("    - 地上開度 (openness_pos) ...")
-            write_feature(f"{stem}_openness_pos_{tag_open}.tif", pos_m)
+            write_feature(f"{dem_path.stem}_openness_pos_{tag_open}.tif", pos_m)
             print("    - 地下開度 (openness_neg) ...")
-            write_feature(f"{stem}_openness_neg_{tag_open}.tif", neg_m)
+            write_feature(f"{dem_path.stem}_openness_neg_{tag_open}.tif", neg_m)
 
-    print("\n[DONE] 全 8 指標（マルチスケール）の出力が完了しました。")
+    print("\n[DONE] 全 8 指標（マルチスケール）の出力が完了しました。」")
 
 
 if __name__ == "__main__":
