@@ -1,4 +1,86 @@
-# --- clip_all_tifs_same_extent_interactive_v3_3.py ---
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+ディレクトリ内の GeoTIFF(.tif) を、共通のクリップ範囲で一括トリムするスクリプト。
+
+■ 想定する用途
+  - DEM / 地形特徴量など多数の TIF を、
+    ・同じ外接矩形（BBox）で揃えたい
+    ・GPKG のポリゴン範囲だけ切り出したい
+  といった場合の一括処理。
+
+■ 入力
+  - 対象ディレクトリ:
+      任意のフォルダ（サブフォルダを再帰的に含めるか選択可）
+      → 拡張子 .tif のファイルを全て対象とする。
+
+  - クリップ範囲 (EPSG:XXXX 座標系で指定):
+      1) 手動入力: xmin, ymin, xmax, ymax を数値入力
+      2) ポリゴン GPKG:
+         - GPKG パスを指定
+         - レイヤを選択
+         - (geopandas 利用可能な場合) 属性一覧を表示し、
+           列と値（複数可）でフィーチャを絞り込んでから bbox/ポリゴンを生成
+         - 属性フィルタしない場合はレイヤ全体を使用
+
+■ 出力
+  - デフォルト出力先:
+      <入力ディレクトリ>/clipped_out/
+  - ファイル名:
+      Clipped-<元のファイル名>.tif
+  - GeoTIFF (TILED=YES, COMPRESS=DEFLATE, PREDICTOR=3, BIGTIFF=IF_SAFER)
+
+■ クリップ方法（対話で選択）
+  - A) BBoxで切り出し（矩形トリム。高速）
+      ・指定 BBox を各 TIF の CRS に transform し、
+        交差する部分だけ window 読み出し
+      ・完全に範囲外の TIF はスキップ
+
+  - B) ポリゴン形状でマスク（外側を NoData。精度重視）
+      ・まず BBox で概略の範囲を切り出し
+      ・その後、ポリゴンでマスク（外側ピクセルを NoData）
+      ・crop オプション ON の場合はマスクの外接矩形にトリム
+
+■ 事前クリーン機能（任意）
+  - gdal_translate が利用可能な場合、
+    各 TIF を一度「きれいな GeoTIFF」に変換してからクリップ:
+      - メタデータ / RAT / GCP を削除
+      - TILED=YES / COMPRESS=DEFLATE / PREDICTOR=2 等で再出力
+    → 元 TIF に難ありな場合の安定性向上を想定。
+
+■ 必要ライブラリ
+  - 必須: rasterio, shapely
+  - 任意: geopandas, fiona
+    ・インストールされていれば GPKG 属性によるフィルタが有効
+  - 任意: gdal_translate, ogr2ogr, ogrinfo
+    ・事前クリーンおよび、GPKG bbox / 形状取得で使用
+
+■ 使い方（例）
+  1) 対話式で起動:
+       python clip_all_tifs_same_extent_interactive_v3_3.py
+
+  2) 対話の流れ:
+       - 入力ディレクトリを指定
+       - 再帰処理の有無を選択
+       - 出力フォルダを指定（空 Enter でデフォルト）
+       - 事前クリーンを行うか選択
+       - クリップ範囲 EPSG を指定（例: 6674）
+       - クリップ範囲の取得方法 (1: 手入力 / 2: GPKG)
+           * 2 の場合:
+               - GPKG パスを指定
+               - レイヤを選択
+               - 属性一覧を確認し、必要なら列＆値でフィルタ
+       - クリップ方法を選択 (A: BBox / B: ポリゴンマスク)
+       - マスク時に crop するかどうかを選択
+       → あとは全 TIF に対して自動処理
+
+■ 制約・注意点
+  - 入力 TIF の CRS が未設定の場合、そのファイルはスキップ。
+  - GPKG 側レイヤの CRS が不明な場合、クリップ EPSG とみなして処理。
+  - 非常に大きな GPKG を属性フィルタする場合、
+    GeoPandas での読込に時間とメモリを要する可能性あり。
+"""
 
 import os, sys, json, tempfile, subprocess, warnings, contextlib
 from pathlib import Path
@@ -164,6 +246,90 @@ def bbox_from_layer(path: str, layer: str, epsg: int) -> Tuple[float,float,float
                 return (minx, miny, maxx, maxy)
     raise RuntimeError("Extent の抽出に失敗。")
 
+
+def select_features_by_attribute(path: str, layer: str, epsg: int):
+    """
+    GPKGレイヤの属性でフィーチャを絞り込む（geopandas 必須）。
+    - 戻り値: 絞り込み後の GeoDataFrame（CRS=EPSG:epsg） or None（失敗/未使用時）
+    """
+    if not HAVE_GPD:
+        print("  ⚠️ geopandas が無いため属性での絞り込みはスキップします。")
+        return None
+    try:
+        gdf = gpd.read_file(path, layer=layer)
+    except Exception as e:
+        print(f"  ⚠️ GPKG読み込みに失敗したため、属性絞り込みをスキップします: {e}")
+        return None
+
+    if gdf.empty:
+        print("  ⚠️ レイヤが空です。属性絞り込みはスキップします。")
+        return None
+
+    # 座標系をEPSGに合わせる
+    if gdf.crs is None:
+        gdf = gdf.set_crs(epsg=epsg)
+    if gdf.crs.to_epsg() != epsg:
+        gdf = gdf.to_crs(epsg=epsg)
+
+    geom_col = gdf.geometry.name
+    attr_cols = [c for c in gdf.columns if c != geom_col]
+
+    if not attr_cols:
+        print("[INFO] 属性列が無いため、レイヤ内の全フィーチャを使用します。")
+        return gdf
+
+    print("\n[属性列一覧]")
+    for i, c in enumerate(attr_cols, 1):
+        try:
+            nunique = gdf[c].nunique(dropna=True)
+        except Exception:
+            nunique = "?"
+        print(f"  [{i}] {c}  (一意値 ≒ {nunique} 個)")
+
+    # 列の選択（空Enterならフィルタ無し）
+    while True:
+        s = input("絞り込みに使う列番号を入力（空Enter=絞り込みなし）: ").strip()
+        if not s:
+            print("[INFO] 属性絞り込みは行わず、レイヤ全体を使用します。")
+            return gdf
+        if s.isdigit() and 1 <= int(s) <= len(attr_cols):
+            col = attr_cols[int(s) - 1]
+            break
+        print("  ❌ 範囲外です。")
+
+
+    # 一意値の一覧
+    uniques = gdf[col].dropna().unique().tolist()
+    try:
+        uniques_sorted = sorted(uniques)
+    except Exception:
+        uniques_sorted = uniques
+
+    print(f"\n列 '{col}' の一意な属性値（最大50件を表示）:")
+    for v in uniques_sorted[:50]:
+        print(f"  - {v}")
+    if len(uniques_sorted) > 50:
+        print(f"  ... ほか {len(uniques_sorted) - 50} 件")
+
+    raw = input("絞り込みに使う値をカンマ区切りで入力（空Enter=その列の全フィーチャを使用）: ").strip()
+    if not raw:
+        print(f"[INFO] 値未指定のため、列 '{col}' での絞り込みは行わず、レイヤ全体を使用します。")
+        return gdf
+
+    wanted = [x.strip() for x in raw.split(",") if x.strip()]
+    # 文字列比較に揃える（タイプ混在対策）
+    series_str = gdf[col].astype(str)
+    wanted_str = [str(v) for v in wanted]
+    filtered = gdf[series_str.isin(wanted_str)].copy()
+
+    if filtered.empty:
+        print("  ⚠️ 絞り込み後のフィーチャが 0 件です。レイヤ全体を使用します。")
+        return gdf
+
+    print(f"[INFO] 絞り込み後フィーチャ数: {len(filtered)}")
+    return filtered
+
+
 def load_shapes_as_geojson_dicts(path: str, layer: str, epsg: int) -> List[dict]:
     if HAVE_GPD:
         try:
@@ -198,7 +364,7 @@ def clamp_intersection(a: BoundingBox, b: BoundingBox) -> Optional[BoundingBox]:
 
 # ---------- clean helpers ----------
 def clean_tif_gdal(src: str, dst: str) -> None:
-    """元TIFを 'きれいな' GTiff に再出力（メタ/ラスタ属性/GCPを除去）"""
+    """元TIFを 'きれいな' GTiff に再出力（RAT/GCPを除去）"""
     cmd = [
         "gdal_translate",
         "-of", "GTiff",
@@ -206,15 +372,26 @@ def clean_tif_gdal(src: str, dst: str) -> None:
         "-co", "COMPRESS=DEFLATE",
         "-co", "PREDICTOR=2",
         "-co", "BIGTIFF=IF_SAFER",
-        "-nomd",   # メタデータ非コピー
+        # "-nomd",   # ★ GDAL 3.10.3 では未サポートのため削除
         "-norat",  # RAT非コピー
         "-nogcp",  # GCP非コピー
         src, dst
     ]
-    # 日本語環境でのログ抑制
+    # 日本語環境でのログ抑制（ログは捨てる）
     env = os.environ.copy()
-    env["CPL_DEBUG"] = "OFF"; env["CPL_LOG"] = "NUL"; env["CPL_ERROR_HANDLER"] = "CPLQuietErrorHandler"
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+    env["CPL_DEBUG"] = "OFF"
+    env["CPL_LOG"] = "NUL"
+    env["CPL_ERROR_HANDLER"] = "CPLQuietErrorHandler"
+
+    subprocess.run(
+        cmd,
+        env=env,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True
+    )
+
 
 # ---------- main ----------
 def main():
@@ -254,14 +431,35 @@ def main():
             "type":"Polygon",
             "coordinates":[[(xmin,ymin),(xmax,ymin),(xmax,ymax),(xmin,ymax),(xmin,ymin)]]
         }]
+
     else:
         gpkg_path = ask_path("ポリゴン GPKG のパス", must_exist=True)
         layer = choose_layer(gpkg_path)
         if not layer:
             print("❌ レイヤー選択に失敗。"); return
         print(f"[INFO] 使用レイヤー: {layer}")
-        clip_bbox_src = bbox_from_layer(gpkg_path, layer, epsg)
-        shapes_geojson = load_shapes_as_geojson_dicts(gpkg_path, layer, epsg)
+
+        # 属性での絞り込み（geopandas がある場合のみ）
+        filtered_gdf = None
+        if HAVE_GPD:
+            filtered_gdf = select_features_by_attribute(gpkg_path, layer, epsg)
+        else:
+            print("  ⚠️ geopandas が無いので、レイヤ全体を使用します。")
+
+        if filtered_gdf is not None:
+            # 絞り込まれたフィーチャだけで bbox / shapes を作成
+            minx, miny, maxx, maxy = filtered_gdf.total_bounds
+            clip_bbox_src = (float(minx), float(miny), float(maxx), float(maxy))
+            shapes_geojson = [
+                mapping(geom)
+                for geom in filtered_gdf.geometry
+                if geom is not None and not geom.is_empty
+            ]
+        else:
+            # 従来どおりレイヤ全体を使用
+            clip_bbox_src = bbox_from_layer(gpkg_path, layer, epsg)
+            shapes_geojson = load_shapes_as_geojson_dicts(gpkg_path, layer, epsg)
+
         print(f"[INFO] BBox (EPSG:{epsg}): {clip_bbox_src}")
 
     print("\nクリップ方法：")
