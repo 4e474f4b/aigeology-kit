@@ -1,76 +1,61 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-rf_geomorph_interactive.py（学習用データ作成＋RandomForest分類・完全版）
+rf_geomorph_toolkit.py
 
-【このスクリプトでできること】
-  1) 学習用データ作成モード
-     - 指定ディレクトリ内のラスター（GeoTIFF 等）とポリゴンGPKGをまとめて読み込み、
-       - 範囲: 手入力の BBOX（xmin, ymin, xmax, ymax）
-         または ポリゴンの外接矩形
-       - 解像度: ユーザー指定グリッド間隔
-       に基づいてグリッドポイントを生成し、
-       各ポイントでラスター値・ポリゴン属性をサンプリングして
-       学習用テーブル（CSV / Parquet / GPKG）を作成する。
+ランダムフォレストを用いた地形分類ワークフローを「対話式 3 モード」で扱うスクリプト。
 
-  2) 学習モード（train）
-     - CSV / Parquet / GPKG 形式の学習用テーブルを読み込み、
-       目的変数（ラベル）列・特徴量列を対話的に選択して
-       RandomForestClassifier を学習する。
-     - SimpleImputer(median) → RandomForest の Pipeline 構成。
-     - 実験タグ run_id を自動採番し、以下を出力:
-         * 学習済みモデル（joblib）
-         * メタ情報 JSON（使用特徴量・ターゲット列・CRS 等）
-         * 特徴量重要度 CSV / PNG
-         * 混同行列（正規化/非正規化）PNG
-         * クラス別指標（precision / recall / F1）のテキスト
+モード概要
+----------
+1) 学習用データ作成（ラスター / ポリゴン → テーブル）
+    - DEM から作成した特徴量ラスターと、地形分類ポリゴンGPKGを読み込み、
+      指定範囲・解像度のグリッドにサンプリングして学習用テーブル
+      （CSV / Parquet / GPKG）を作成する。
 
-  3) 予測モード（predict）
-     - 保存済みモデル＋メタ情報を読み込み、
-       新しいテーブル（CSV / Parquet / GPKG）に対して予測を実行する。
-     - 学習時と同じ特徴量名を自動照合（簡易エイリアス補完あり）し、
-       y_pred / proba_max などを付与したテーブルを出力する。
-     - 正解ラベル列が含まれていれば、自動で混同行列・指標を再計算する。
+2) 学習（train）
+    - 目的変数（例: 地形分類コード）と特徴量列を選択し、
+      RandomForest で分類モデルを作成する。
 
-【典型的なワークフロー】
-  1. 学習用データを作る
-       python rf_geomorph_interactive.py
-         → 「1) 学習用データ作成」を選択
-         → ラスター/ポリゴンの入ったディレクトリを指定
-         → 範囲・解像度・付与するポリゴン属性を指定
-         → train_data.gpkg / .csv / .parquet などを出力
+    [検証方法の選択]
+      1) ホールドアウト法（学習/テストに分割）
+          - データを「学習用」と「テスト用」に 1 回だけ分割。
+          - `テストデータ割合` でテスト側に回す比率を指定（例: 0.2 ⇒ 8:2）。
+      2) k-分割クロスバリデーション
+          - データ全体を k 個に分割し、k 回学習・検証を繰り返す。
+          - `k-分割数` で k を指定（例: 5 ⇒ 5-fold CV）。
 
-  2. モデルを学習する
-         python rf_geomorph_interactive.py
-           → 「2) 学習（train）」を選択
-           → 1 で作成したテーブルを指定
-           → 目的変数（例: LandClass）と特徴量列を対話的に選択
-           → rf_model_xxxxxx.joblib / rf_meta_xxxxxx.json などを出力
+    [主なパラメータの意味]
+      - random_state:
+          乱数の種。固定すると毎回同じ分割・同じ結果になり、再現性がとれる。
+      - 層化サンプリング / 層化CV:
+          クラス比率（地形分類コードの出現比）が各分割でも元データと
+          できるだけ同じになるように分割する設定。
+          クラス不均衡な分類問題では、基本的に「Y（使う）」が推奨。
+      - n_estimators（木の本数）:
+          ランダムフォレスト内の決定木の本数。増やすと精度は上がりやすいが、
+          計算時間も増える。とりあえず 200〜500 程度が無難。
+      - max_depth（木の深さの上限）:
+          各決定木の深さの上限。None（空 Enter）の場合は制限なし。
+          深さに制限をかけると、過学習をある程度抑えられることがある。
+      - class_weight='balanced':
+          クラスごとの出現頻度に応じて自動で重み付けする設定。
+          少数派クラスの誤分類を相対的に重く扱うことで、
+          不均衡データに対して感度を上げる。
 
-  3. 別エリアや別DEMから作成した特徴量テーブルに予測をかける
-         python rf_geomorph_interactive.py
-           → 「3) 予測（predict）」を選択
-           → 2 で保存したモデル＋メタ情報を指定
-           → 予測対象テーブルを指定
-           → y_pred 付きテーブル（CSV / Parquet / GPKG）を出力
+    [モデル出力]
+      - モデル本体:   <出力ルート>/<元テーブル名>_<run_id>/rf_model.joblib
+      - メタ情報:     <出力ルート>/<元テーブル名>_<run_id>/rf_meta.json
+      - 特徴量重要度: <出力ルート>/<元テーブル名>_<run_id>/rf_feature_importance.csv
 
-【定義・前提】
-  - 特徴量テーブル:
-      * 各行 = 1 地点（通常はグリッドの中心点）
-      * x, y 列があれば GPKG 出力時にポイントジオメトリを生成可能。
-      * それ以外の数値列はすべて候補特徴量として扱える。
-  - 目的変数（ターゲット）:
-      * 列名は任意（例: LandClass, label など）
-      * 文字列ラベルの場合は LabelEncoder で内部的に整数に変換される。
-  - run_id:
-      * 学習ごとに一意な ID（例: 20251113_163000_train001）
-      * モデル・メタ情報・図表・CSV のファイル名に付与される。
-  - 座標参照系（CRS）:
-      * ラスター・ポリゴンは同一CRSであることが前提。
-      * GPKG 出力時には EPSG コード等を対話的に指定（ask_crs）する。
+3) 予測（predict）
+    - 保存済みモデルとメタ情報を読み込み、別のテーブルに対して予測を行う。
+    - 予測結果を元テーブルに結合した CSV / Parquet / GPKG を出力する。
 
-依存: numpy, pandas, scikit-learn, joblib, matplotlib, (pyarrow: Parquet I/O),
-     geopandas, shapely, fiona, (pyogrio: 推奨), rasterio（学習用データ作成で使用）
+この docstring を見れば、
+  * 検証方法（ホールドアウト / k-分割CV）の違い
+  * random_state / 層化サンプリング / class_weight の意味
+  * モデルファイルがどこに・どのファイル名で出るか
+を後から振り返れるようにしている。
 """
 
 import os
@@ -83,7 +68,8 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import (
+    train_test_split, StratifiedKFold, KFold, cross_validate, cross_val_predict)
 from sklearn.metrics import (
     confusion_matrix,
     classification_report,
@@ -344,6 +330,13 @@ def make_training_data_mode():
         print("ディレクトリが見つかりません。終了します。")
         return
 
+    # --- 出力先の指定（先に聞いておく） ---
+    out_path = strip_quotes(input("学習用テーブルの出力パス（.csv / .parquet / .gpkg）: ").strip())
+    if not out_path:
+        print("出力パスが指定されていません。終了します。")
+        return
+    out_suffix = Path(out_path).suffix.lower()
+
     # --- ラスター/ポリゴンの探索 ---
     raster_exts = (".tif", ".tiff", ".img")
     rasters: list[Path] = []
@@ -364,31 +357,43 @@ def make_training_data_mode():
     if rasters:
         print("\n[INFO] 検出したラスター:")
         for i, r in enumerate(rasters):
-            print(f"  [{i:02d}] {r}")
+            print(f"  [R{i:02d}] {r}")
     else:
         print("\n[INFO] ラスターは検出されませんでした（ポリゴン属性だけでもテーブルは作成できます）。")
 
     if polygons:
         print("\n[INFO] 検出したポリゴンGPKG:")
         for i, g in enumerate(polygons):
-            print(f"  [{i:02d}] {g}")
+            print(f"  [P{i:02d}] {g}")
     else:
         print("\n[INFO] ポリゴンGPKGは検出されませんでした。")
 
     # どのラスターを使うか（空Enter=全て）
     if rasters:
-        use_r_idx = input("\n特徴量として使用するラスターの番号（カンマ区切り、空=全て）: ").strip()
+        use_r_idx = input(
+            "\n特徴量として使用するラスターの番号 "
+            "（例: 0,1,3 または R0,R1,R3。空=全て）: "
+        ).strip()
         if use_r_idx:
             idxs: list[int] = []
             for tok in use_r_idx.split(","):
                 tok = tok.strip()
                 if not tok:
                     continue
+                # R0 / r0 形式 → 0 に変換
+                m = re.fullmatch(r"[Rr](\d+)", tok)
+                if m:
+                    tok = m.group(1)
                 try:
-                    idxs.append(int(tok))
+                    i = int(tok)
                 except ValueError:
                     print(f"  ⚠ 無視します: '{tok}'")
-            rasters = [rasters[i] for i in idxs if 0 <= i < len(rasters)]
+                    continue
+                if 0 <= i < len(rasters):
+                    idxs.append(i)
+                else:
+                    print(f"  ⚠ 範囲外の番号なので無視します: {i}")
+            rasters = [rasters[i] for i in idxs]
             if not rasters:
                 print("  ⚠ 有効なラスターが選択されませんでした。ラスターなしで続行します。")
 
@@ -397,7 +402,11 @@ def make_training_data_mode():
     if polygons:
         ans = input("ポリゴンGPKGの属性値も特徴量/ラベルとして付与しますか？ [y/N]: ").strip().lower() or "n"
         if ans.startswith("y"):
-            p_idx = input("  使用するポリゴンGPKGの番号（空=0）: ").strip()
+            p_idx = input("  使用するポリゴンGPKGの番号（例: 0 または P0。空=0）: ").strip()
+            if p_idx:
+                m = re.fullmatch(r"[Pp](\d+)", p_idx)
+                if m:
+                    p_idx = m.group(1)
             try:
                 p_i = int(p_idx) if p_idx else 0
             except ValueError:
@@ -432,8 +441,12 @@ def make_training_data_mode():
         if not poly_for_attr:
             print("\n[範囲用ポリゴンの選択]")
             for i, g in enumerate(polygons):
-                print(f"  [{i:02d}] {g}")
-            p_idx = input("範囲用ポリゴンGPKGの番号（空=0）: ").strip()
+                print(f"  [P{i:02d}] {g}")
+            p_idx = input("範囲用ポリゴンGPKGの番号（例: 0 または P0。空=0）: ").strip()
+            if p_idx:
+                m = re.fullmatch(r"[Pp](\d+)", p_idx)
+                if m:
+                    p_idx = m.group(1)
             try:
                 p_i = int(p_idx) if p_idx else 0
             except ValueError:
@@ -446,7 +459,6 @@ def make_training_data_mode():
             poly_for_extent = poly_for_attr
 
         try:
-            import fiona
             layers = fiona.listlayers(poly_for_extent)
             print(f"  範囲用GPKGのレイヤ一覧: {', '.join(layers)}")
         except Exception:
@@ -553,8 +565,12 @@ def make_training_data_mode():
                 geometry=[Point(xy) for xy in zip(df["x"].values, df["y"].values)],
                 crs=poly_gdf.crs,
             )
-            joined = gpd.sjoin(pts_gdf, poly_gdf[attr_cols + ["geometry"]] if attr_cols else poly_gdf,
-                               how="left", predicate="intersects")
+            joined = gpd.sjoin(
+                pts_gdf,
+                poly_gdf[attr_cols + ["geometry"]] if attr_cols else poly_gdf,
+                how="left",
+                predicate="intersects",
+            )
             drop_cols = [c for c in joined.columns if c in ("index_right",)]
             joined = joined.drop(columns=drop_cols)
             if "geometry" in joined.columns:
@@ -563,13 +579,7 @@ def make_training_data_mode():
             print(f"  → ポリゴン属性を付与しました（列数: {len(attr_cols) if attr_cols else 0}）")
 
     # --- 出力 ---
-    print("\n[出力]")
-    out_path = strip_quotes(input("学習用テーブルの出力パス（.csv / .parquet / .gpkg）: ").strip())
-    if not out_path:
-        print("出力パスが指定されていません。終了します。")
-        return
-
-    out_suffix = Path(out_path).suffix.lower()
+    print("\n[出力]")  # out_path / out_suffix は関数冒頭で取得済み
     if out_suffix in [".parquet", ".pq"]:
         try:
             df.to_parquet(out_path, index=False)
@@ -660,9 +670,38 @@ def train_mode():
     print("\n=== 学習モード（train） ===")
     df, path = load_table_interactive()
 
-    # ターゲット＋特徴量列
-    target_col, feature_cols = choose_target_and_features(df)
+    # 行数が多い場合に、先頭 N 行だけを使うオプション
+    total_rows = len(df)
+    print(f"[INFO] テーブル行数: {total_rows:,}")
+    max_rows_in = input(
+        "学習に使う最大行数（空=全件, 例: 50000 や 50）: "
+    ).strip()
+    if max_rows_in:
+        try:
+            max_rows = int(max_rows_in)
+            if 0 < max_rows < total_rows:
+                df = df.head(max_rows)
+                print(f"  → 先頭 {max_rows:,} 行のみを学習に使用します。")
+            else:
+                print("  → 全件を使用します。")
+        except ValueError:
+            print("  ⚠ 整数として解釈できなかったため、全件を使用します。")
 
+    # モデル出力先（ルートフォルダ）を先に決めておく
+    print("\n[モデル出力設定]")
+    base = Path(path)
+    default_root = base.with_suffix("").parent / "rf_models"
+    out_root_in = strip_quotes(
+        input(f"モデル保存ルートフォルダ（空={default_root}）: ").strip()
+    )
+    if out_root_in:
+        model_root = Path(out_root_in)
+    else:
+        model_root = default_root
+    model_root.mkdir(parents=True, exist_ok=True)
+
+    # ターゲット＋特徴量列（サンプリング後の df に対して実施）
+    target_col, feature_cols = choose_target_and_features(df)
     # ターゲットが文字列なら LabelEncoder で整数化
     y_raw = df[target_col]
     if y_raw.dtype.kind in ("O", "U", "S"):
@@ -681,17 +720,15 @@ def train_mode():
 
     X = df[feature_cols].values.astype(float)
 
-    print("\n[学習データ分割設定]")
-    test_size = input("テストデータ割合（0〜0.5 程度, 空=0.2）: ").strip()
-    if test_size:
-        try:
-            test_size = float(test_size)
-        except ValueError:
-            print("  ⚠ 数値変換に失敗したので 0.2 を使います。")
-            test_size = 0.2
-    else:
-        test_size = 0.2
+    # -------------------------------
+    # 検証方法の選択（ホールドアウト / k分割CV）
+    # -------------------------------
+    print("\n[検証方法の選択]")
+    print("  1) ホールドアウト法（学習/テストに分割）")
+    print("  2) k-分割クロスバリデーション")
+    val_mode = input("番号を選択してください [1/2]（空=1）: ").strip() or "1"
 
+    # 共通: random_state
     random_state = input("random_state（空=42）: ").strip()
     if random_state:
         try:
@@ -702,13 +739,12 @@ def train_mode():
     else:
         random_state = 42
 
-    stratify = y if ask_yes_no("層化サンプリングを使いますか？", default=True) else None
+    # 共通: 層化を使うかどうか
+    use_stratify = ask_yes_no("層化サンプリング / 層化CV を使いますか？", default=True)
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size,
-        random_state=random_state, stratify=stratify
-    )
-
+    # -------------------------------
+    # RandomForest パラメータ設定（共通）
+    # -------------------------------
     print("\n[RandomForest パラメータ設定]")
     n_estimators = input("n_estimators（木の本数, 空=200）: ").strip()
     if n_estimators:
@@ -746,31 +782,138 @@ def train_mode():
         ("imputer", SimpleImputer(strategy="median")),
         ("rf", rf),
     ])
+    # -------------------------------
+    # 検証ロジック
+    # -------------------------------
+    if val_mode == "2":
+        # ===== k-分割クロスバリデーション =====
+        print("\n[クロスバリデーション設定]")
+        k_in = input("k-分割数（空=5）: ").strip()
+        if k_in:
+            try:
+                k_splits = int(k_in)
+            except ValueError:
+                print("  ⚠ 整数変換に失敗したので 5 を使います。")
+                k_splits = 5
+        else:
+            k_splits = 5
 
-    print("\n[学習中...]")
-    pipe.fit(X_train, y_train)
-    print("学習完了。")
+        if k_splits < 2:
+            print("  ⚠ k は 2 以上が必要なので 5 を使います。")
+            k_splits = 5
 
-    # 評価
-    print("\n[評価（テストデータ）]")
-    y_pred = pipe.predict(X_test)
-    cm = confusion_matrix(y_test, y_pred)
-    print("混同行列（行: 真, 列: 予測）:")
-    print(cm)
-    print("\nclassification_report:")
-    if label_encoder_info:
-        target_names = class_names
+        if use_stratify:
+            cv = StratifiedKFold(
+                n_splits=k_splits, shuffle=True, random_state=random_state
+            )
+        else:
+            cv = KFold(
+                n_splits=k_splits, shuffle=True, random_state=random_state
+            )
+
+        print("\n[クロスバリデーション中...]")
+        scoring = {
+            "accuracy": "accuracy",
+            "f1_macro": "f1_macro",
+            "f1_weighted": "f1_weighted",
+        }
+        cv_result = cross_validate(
+            pipe, X, y, cv=cv, scoring=scoring,
+            n_jobs=-1, return_train_score=False,
+        )
+
+        print("\n[CV 結果]")
+        for key, label in [
+            ("test_accuracy", "Accuracy"),
+            ("test_f1_macro", "F1-macro"),
+            ("test_f1_weighted", "F1-weighted"),
+        ]:
+            vals = cv_result[key]
+            print(f"  {label}: {vals.mean():.4f} ± {vals.std():.4f} (n={len(vals)})")
+
+        # OOF 予測から混同行列・レポートを作成
+        print("\n[評価（クロスバリデーションの out-of-fold 予測）]")
+        y_oof = cross_val_predict(pipe, X, y, cv=cv, n_jobs=-1)
+        cm = confusion_matrix(y, y_oof)
+        print("混同行列（行: 真, 列: 予測）:")
+        print(cm)
+        print("\nclassification_report:")
+        if label_encoder_info:
+            target_names = class_names
+        else:
+            target_names = [str(c) for c in class_names]
+        print(classification_report(y, y_oof, target_names=target_names))
+
+        # 最終モデルは全データでフィット
+        print("\n[最終モデルの学習（全データで再学習）...]")
+        pipe.fit(X, y)
+        print("学習完了。")
+
+        eval_mode = "cv"
+        eval_info = {
+            "cv_n_splits": k_splits,
+            "use_stratify": use_stratify,
+            "scores": {
+                "accuracy_mean": float(cv_result["test_accuracy"].mean()),
+                "accuracy_std": float(cv_result["test_accuracy"].std()),
+                "f1_macro_mean": float(cv_result["test_f1_macro"].mean()),
+                "f1_macro_std": float(cv_result["test_f1_macro"].std()),
+                "f1_weighted_mean": float(cv_result["test_f1_weighted"].mean()),
+                "f1_weighted_std": float(cv_result["test_f1_weighted"].std()),
+            },
+        }
+
     else:
-        target_names = [str(c) for c in class_names]
-    print(classification_report(y_test, y_pred, target_names=target_names))
+        # ===== ホールドアウト法 =====
+        print("\n[学習データ分割設定（ホールドアウト）]")
+        test_size = input("テストデータ割合（0〜0.5 程度, 空=0.2）: ").strip()
+        if test_size:
+            try:
+                test_size = float(test_size)
+            except ValueError:
+                print("  ⚠ 数値変換に失敗したので 0.2 を使います。")
+                test_size = 0.2
+        else:
+            test_size = 0.2
+
+        stratify = y if use_stratify else None
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size,
+            random_state=random_state, stratify=stratify
+        )
+
+        print("\n[学習中...]")
+        pipe.fit(X_train, y_train)
+        print("学習完了。")
+
+        # 評価（テストデータ）
+        print("\n[評価（ホールドアウトのテストデータ）]")
+        y_pred = pipe.predict(X_test)
+        cm = confusion_matrix(y_test, y_pred)
+        print("混同行列（行: 真, 列: 予測）:")
+        print(cm)
+        print("\nclassification_report:")
+        if label_encoder_info:
+            target_names = class_names
+        else:
+            target_names = [str(c) for c in class_names]
+        print(classification_report(y_test, y_pred, target_names=target_names))
+
+        eval_mode = "holdout"
+        eval_info = {
+            "test_size": test_size,
+            "use_stratify": use_stratify,
+        }
 
     # 実験ID (run_id)
     now = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_id = f"{now}_train001"
+    run_id = f"rf_{now}"
 
     # 保存ディレクトリ
-    base = Path(path)
-    out_dir = base.parent
+    # 先に決めた model_root の下に <元テーブル名>_<run_id> フォルダを掘る
+    # （train_mode 冒頭で base / model_root を定義済み）
+    out_dir = model_root / f"{base.stem}_{run_id}"
     model_path = out_dir / f"rf_model_{run_id}.joblib"
     meta_path  = out_dir / f"rf_meta_{run_id}.json"
     imp_path   = out_dir / f"rf_feature_importance_{run_id}.csv"
@@ -787,6 +930,10 @@ def train_mode():
         "feature_cols": feature_cols,
         "class_names": target_names,
         "label_encoder": label_encoder_info,
+        "validation": {
+            "mode": eval_mode,
+            **eval_info,
+        },
         "train_params": {
             "test_size": test_size,
             "random_state": random_state,
@@ -910,6 +1057,39 @@ def predict_mode():
 
     df, in_path = load_table_interactive()
 
+    # 行数が多い場合に、先頭 N 行だけを使うオプション
+    total_rows = len(df)
+    print(f"[INFO] テーブル行数: {total_rows:,}")
+    max_rows_in = input(
+        "予測に使う最大行数（空=全件, 例: 50）: "
+    ).strip()
+    if max_rows_in:
+        try:
+            max_rows = int(max_rows_in)
+            if 0 < max_rows < total_rows:
+                df = df.head(max_rows)
+                print(f"  → 先頭 {max_rows:,} 行のみを予測に使用します。")
+            else:
+                print("  → 全件を使用します。")
+        except ValueError:
+            print("  ⚠ 整数として解釈できなかったため、全件を使用します。")
+
+    # 評価結果の出力用プレフィックス（元テーブル名 + run_id）
+    base_in = str(Path(in_path).with_suffix(""))
+    run_id = meta.get("run_id", "predict")
+    eval_prefix = f"{base_in}_eval_{run_id}"
+
+    # 入力GPKGのCRSを取得（あれば、後の ask_crs の既定値に使う）
+    source_crs_str = None
+    if in_path.lower().endswith(".gpkg"):
+        try:
+            gdf_src = _read_gpkg_with_geom(in_path)
+            if gdf_src.crs is not None:
+                source_crs_str = gdf_src.crs.to_string()
+                print(f"[INFO] 入力GPKGのCRS: {source_crs_str}")
+        except Exception as e:
+            print(f"[WARN] 入力GPKGのCRS取得に失敗しました: {e}")
+
     # 特徴量列の整合性チェック
     print("\n[特徴量列の整合性チェック]")
     saved_feats = feature_cols
@@ -967,17 +1147,46 @@ def predict_mode():
     if proba_max is not None:
         out["proba_max"] = proba_max
 
+    # 後で confusion matrix / classification_report を CSV に出すためのフラグ
+    saved_eval = False
+
     # 正解ラベルがあれば評価
     if target_col in df.columns:
         print("\n[評価（入力テーブルに正解ラベルが含まれていたため）]")
         y_true = df[target_col].values
+
         # 文字列 vs 整数の可能性があるので揃える
         if label_encoder_info and class_names:
-            # y_true がクラス名であることを期待
-            y_true_int = np.array([class_names.index(str(v)) if str(v) in class_names else -1 for v in y_true])
+            # ---- 正解ラベル → 学習時クラスID へのマッピングを少し頑丈に ----
+            # ・学習時クラス名を str + strip() で正規化
+            # ・"01001" と 1001 のようなケースに備えて int(str) もキー登録
+            norm_to_idx: dict[str, int] = {}
+            for idx, name in enumerate(class_names):
+                s = str(name).strip()
+                norm_to_idx[s] = idx
+                try:
+                    iv = int(s)
+                    norm_to_idx[str(iv)] = idx
+                except Exception:
+                    pass
+
+            mapped = []
+            for v in y_true:
+                s = str(v).strip()
+                if s in norm_to_idx:
+                    mapped.append(norm_to_idx[s])
+                else:
+                    mapped.append(-1)
+
+            y_true_int = np.array(mapped, dtype=int)
             valid_mask = y_true_int >= 0
+            unmatched = int((~valid_mask).sum())
+
+            if unmatched > 0:
+                print(f"  ⚠ 正解ラベルのうち {unmatched} 件は学習時クラスとマッチしなかったため、評価から除外しました。")
+
             if not np.any(valid_mask):
-                print("  ⚠ y_true がクラス名と一致しなかったため、評価をスキップします。")
+                print("  ⚠ 有効な正解ラベルが 1 件もなかったため、評価をスキップします。")
             else:
                 y_true_valid = y_true_int[valid_mask]
                 y_pred_valid = y_pred[valid_mask]
@@ -989,7 +1198,36 @@ def predict_mode():
                     y_true_valid, y_pred_valid,
                     target_names=class_names,
                 ))
+
+                # --- 評価結果をファイル出力 ---
+                try:
+                    # 混同行列を CSV へ
+                    cm_df = pd.DataFrame(
+                        cm,
+                        index=class_names,
+                        columns=class_names,
+                    )
+                    cm_path = f"{eval_prefix}_confusion_matrix.csv"
+                    cm_df.to_csv(cm_path, encoding="utf-8-sig")
+                    print(f"  → 混同行列を保存しました: {cm_path}")
+
+                    # classification_report を CSV へ
+                    rep_dict = classification_report(
+                        y_true_valid, y_pred_valid,
+                        target_names=class_names,
+                        output_dict=True,
+                    )
+                    rep_df = pd.DataFrame(rep_dict).T
+                    rep_path = f"{eval_prefix}_classification_report.csv"
+                    rep_df.to_csv(rep_path, encoding="utf-8-sig")
+                    print(f"  → classification_report を保存しました: {rep_path}")
+
+                    saved_eval = True
+                except Exception as e:
+                    print(f"  ⚠ 評価結果の保存に失敗しました: {e}")
+
         else:
+            # ラベルエンコーダを使っていない場合は、そのまま比較
             cm = confusion_matrix(y_true, y_pred_labels)
             print("混同行列（行: 真, 列: 予測）:")
             print(cm)
@@ -999,9 +1237,73 @@ def predict_mode():
                 target_names=class_names if class_names else None,
             ))
 
+            # --- 評価結果をファイル出力 ---
+            try:
+                if class_names:
+                    idx_names = class_names
+                    rep_target_names = class_names
+                else:
+                    # クラス名が無い場合はユニーク値をソートして名前にする
+                    uniq = sorted(pd.unique(y_true))
+                    idx_names = [str(u) for u in uniq]
+                    rep_target_names = idx_names
+
+                cm_df = pd.DataFrame(
+                    cm,
+                    index=idx_names,
+                    columns=idx_names,
+                )
+                cm_path = f"{eval_prefix}_confusion_matrix.csv"
+                cm_df.to_csv(cm_path, encoding="utf-8-sig")
+                print(f"  → 混同行列を保存しました: {cm_path}")
+
+                rep_dict = classification_report(
+                    y_true, y_pred_labels,
+                    target_names=rep_target_names,
+                    output_dict=True,
+                )
+                rep_df = pd.DataFrame(rep_dict).T
+                rep_path = f"{eval_prefix}_classification_report.csv"
+                rep_df.to_csv(rep_path, encoding="utf-8-sig")
+                print(f"  → classification_report を保存しました: {rep_path}")
+
+                saved_eval = True
+            except Exception as e:
+                print(f"  ⚠ 評価結果の保存に失敗しました: {e}")
+
+    # 予測結果のクラスごとの件数サマリも必ず出力
+    try:
+        if label_encoder_info and class_names:
+            # y_pred は整数クラスID
+            tmp = pd.DataFrame({"cls_id": y_pred})
+            grp = tmp.groupby("cls_id").size().sort_index()
+            cls_labels = [class_names[int(i)] for i in grp.index]
+        else:
+            tmp = pd.DataFrame({"cls": y_pred_labels})
+            grp = tmp.groupby("cls").size().sort_index()
+            cls_labels = [str(c) for c in grp.index]
+
+        summary_df = pd.DataFrame({
+            "class": cls_labels,
+            "count": grp.values,
+        })
+        if proba_max is not None:
+            # クラス別の平均最大確率
+            if label_encoder_info and class_names:
+                tmp2 = pd.DataFrame({"cls_id": y_pred, "proba_max": proba_max})
+                gm = tmp2.groupby("cls_id")["proba_max"].mean().reindex(grp.index)
+            else:
+                tmp2 = pd.DataFrame({"cls": y_pred_labels, "proba_max": proba_max})
+                gm = tmp2.groupby("cls")["proba_max"].mean().reindex(grp.index)
+            summary_df["proba_max_mean"] = gm.values
+
+        summary_path = f"{eval_prefix}_pred_summary.csv"
+        summary_df.to_csv(summary_path, index=False, encoding="utf-8-sig")
+        print(f"\n  → 予測クラスの件数サマリを保存しました: {summary_path}")
+    except Exception as e:
+        print(f"\n  ⚠ 予測サマリの保存に失敗しました: {e}")
+
     # 出力ファイル名
-    base_in = str(Path(in_path).with_suffix(""))
-    run_id = meta.get("run_id", "predict")
     out_path = input(f"\n予測結果の保存先（空なら {base_in}_pred_{run_id}.ext）: ").strip()
     if not out_path:
         # 入力の拡張子に応じて自動決定
@@ -1029,7 +1331,9 @@ def predict_mode():
 
         if use_geom:
             gtmp = gpd.GeoDataFrame(out, geometry="geometry")
-            crs = ask_crs(default_epsg=str(gtmp.crs) if gtmp.crs else "EPSG:4326")
+            # 入力GPKGのCRS or geometryのCRS を既定値にする
+            default_crs = source_crs_str or (str(gtmp.crs) if gtmp.crs else "EPSG:4326")
+            crs = ask_crs(default_epsg=default_crs)
             gtmp.set_crs(crs, inplace=True)
             layer_name = input("GPKGのレイヤ名（空=pred）: ").strip() or "pred"
             gtmp.to_file(out_path, driver="GPKG", layer=layer_name)
@@ -1037,7 +1341,8 @@ def predict_mode():
         else:
             # x,y 列があればそこから点を作る
             if {"x", "y"}.issubset(out.columns):
-                crs = ask_crs()
+                default_crs = source_crs_str or "EPSG:4326"
+                crs = ask_crs(default_epsg=default_crs)
                 layer_name = input("GPKGのレイヤ名（空=pred）: ").strip() or "pred"
                 save_gpkg_with_points(out, out_path, x_col="x", y_col="y",
                                       crs_epsg=crs, layer_name=layer_name)
