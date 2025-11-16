@@ -3,18 +3,27 @@
 """
 rf_geomorph_toolkit.py
 
-ランダムフォレストを用いた地形分類ワークフローを「対話式 3 モード」で扱うスクリプト。
+ランダムフォレストを用いた地形分類ワークフローを
+「対話式 3 モード」で一通り回せるツールキット。
 
 モード概要
 ----------
 1) 学習用データ作成（ラスター / ポリゴン → テーブル）
-    - DEM から作成した特徴量ラスターと、地形分類ポリゴンGPKGを読み込み、
-      指定範囲・解像度のグリッドにサンプリングして学習用テーブル
+    - DEM から作成した特徴量ラスター（GeoTIFF 等）と、地形分類ポリゴンGPKGを読み込み、
+      指定範囲・解像度のグリッド点にサンプリングして「学習用テーブル」
       （CSV / Parquet / GPKG）を作成する。
+    - 範囲は
+        * 手動で xmin, ymin, xmax, ymax を入力
+        * ポリゴンGPKGの外接矩形を自動利用
+      のどちらかを選択。
+    - GPKG 出力時は x, y から Point geometry を生成し、レイヤ名 "train" で書き出す。
+      （この GPKG をそのまま学習モードの入力として使える）
 
 2) 学習（train）
     - 目的変数（例: 地形分類コード）と特徴量列を選択し、
-      RandomForest で分類モデルを作成する。
+      RandomForestClassifier で分類モデルを作成する。
+    - 学習に使うデータ行数の上限を指定可能（動作確認用の軽量サンプル）。
+      空 Enter の場合は「全件」を対象とする。
 
     [検証方法の選択]
       1) ホールドアウト法（学習/テストに分割）
@@ -42,25 +51,62 @@ rf_geomorph_toolkit.py
           少数派クラスの誤分類を相対的に重く扱うことで、
           不均衡データに対して感度を上げる。
 
-    [モデル出力]
-      - モデル本体:   <出力ルート>/<元テーブル名>_<run_id>/rf_model.joblib
-      - メタ情報:     <出力ルート>/<元テーブル名>_<run_id>/rf_meta.json
-      - 特徴量重要度: <出力ルート>/<元テーブル名>_<run_id>/rf_feature_importance.csv
-
 3) 予測（predict）
     - 保存済みモデルとメタ情報を読み込み、別のテーブルに対して予測を行う。
+    - 予測対象行数の上限を対話的に指定可能。
+        * GPKG の場合:
+            - SQLite 経由で SELECT * FROM "<layer>" LIMIT N を実行し、
+              先頭から N 行だけ属性テーブルを高速に取得する（geometry は落とす）。
+        * CSV / Parquet の場合:
+            - いったん全件読み込んだ上で、必要なら DataFrame.sample(...)
+              によりランダムサンプル（is_random_sample=True）を取る。
     - 予測結果を元テーブルに結合した CSV / Parquet / GPKG を出力する。
+      出力先パスは最初に決定し、そのパスに合わせて評価ファイルも同じディレクトリへ保存する。
+
+    [評価機能]
+      - 入力テーブルに「正解ラベル（target_col）」が含まれている場合は、
+        予測と突き合わせて自動的に評価を行う。
+      - LabelEncoder 使用有無に応じて、ラベル対応関係を自動チェックし、
+        必要に応じて対話的にマッピングを補正できる。
+      - 評価結果は次の CSV として保存される（予測結果 out_path を `..._pred_xxx.*` とした場合）
+          * `..._pred_xxx_eval_confusion_matrix.csv`
+          * `..._pred_xxx_eval_classification_report.csv`
+          * `..._pred_xxx_eval_pred_summary.csv`
+        （pred_summary はクラスごとの件数と平均確信度 proba_max を出力）
+
+[モデル出力]
+  - 実験ごとの保存先:
+      <出力ルート>/<元テーブル名>_<run_id>/
+        ├ rf_model_<run_id>.joblib
+        ├ rf_meta_<run_id>.json
+        ├ rf_feature_importance_<run_id>.csv
+        ├ rf_feature_importance_<run_id>.png
+        ├ rf_confusion_matrix_<run_id>.png
+        └ rf_confusion_matrix_normalized_<run_id>.png
+  - 直近モデルへのショートカット:
+      <出力ルート>/
+        ├ rf_model.joblib
+        └ rf_meta.json
 
 この docstring を見れば、
+  * 学習用テーブルの作り方（ラスター＋ポリゴン → グリッドサンプリング）
   * 検証方法（ホールドアウト / k-分割CV）の違い
   * random_state / 層化サンプリング / class_weight の意味
-  * モデルファイルがどこに・どのファイル名で出るか
+  * 予測モードでの高速ローダー（GPKG=SQLite LIMIT / CSV・Parquet=ランダムサンプル）の挙動
+  * モデルファイルや評価ファイルがどこに・どのファイル名で出るか
 を後から振り返れるようにしている。
 """
 
 import os
 import sys
 import json
+import sqlite3
+
+try:
+    import pyarrow.parquet as _pq  # Parquet のメタ情報取得用（あれば使う）
+except Exception:
+    _pq = None
+
 import re
 from pathlib import Path
 from datetime import datetime
@@ -168,13 +214,56 @@ def setup_matplotlib_japanese_font():
     matplotlib.rcParams["font.family"] = chosen
     matplotlib.rcParams["axes.unicode_minus"] = False  # マイナス記号の豆腐回避
 
+def _plot_confusion_matrix(cm, labels, normalize=False,
+                           title="Confusion matrix", cmap=None, save_path=None):
+    """
+    混同行列を画像として保存するヘルパー。
+    labels: クラスラベルのリスト（len(labels) == cm.shape[0] を想定）
+    """
+    if normalize:
+        with np.errstate(all="ignore"):
+            cmn = cm.astype(float) / cm.sum(axis=1, keepdims=True)
+        cm_plot = cmn
+    else:
+        cm_plot = cm
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    im = ax.imshow(cm_plot, interpolation="nearest", cmap=cmap or "Blues")
+    ax.figure.colorbar(im, ax=ax)
+    ax.set_title(title)
+
+    tick_marks = np.arange(len(labels))
+    ax.set_xticks(tick_marks)
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_yticks(tick_marks)
+    ax.set_yticklabels(labels)
+    ax.set_ylabel("True label")
+    ax.set_xlabel("Predicted label")
+
+    fmt = ".2f" if normalize else "d"
+    thresh = cm_plot.max() / 2.0 if cm_plot.size > 0 else 0
+    for i in range(cm_plot.shape[0]):
+        for j in range(cm_plot.shape[1]):
+            ax.text(
+                j, i, format(cm_plot[i, j], fmt),
+                ha="center", va="center",
+                color="white" if cm_plot[i, j] > thresh else "black",
+            )
+
+    fig.tight_layout()
+    if save_path is not None:
+        fig.savefig(save_path, dpi=150)
+        print(f"[保存] 混同行列 図: {save_path}")
+    plt.close(fig)
+
+
 # =========================================================
 # ユーティリティ
 # =========================================================
 
 MODEL_DEFAULT = "rf_model.joblib"
 META_DEFAULT  = "rf_meta.json"
-IMP_DEFAULT   = "rf_feature_importance.csv"
+# IMP_DEFAULT   = "rf_feature_importance.csv"
 
 
 def strip_quotes(s: str) -> str:
@@ -187,7 +276,13 @@ def list_columns(df: pd.DataFrame, title="カラム一覧"):
 
 def input_indices(prompt: str, max_index: int, allow_empty=False):
     """
-    カンマ区切りの整数インデックス入力を受け取り、整数リストを返す。
+    カンマ区切りのインデックス入力を受け取り、整数リストを返す。
+
+    サポートする書式:
+      - 単一インデックス: 2, 5, 010 など
+      - 範囲指定: 2-10, 0-41 など（両端を含む）
+      - 混在: 0, 2-5, 10
+
     allow_empty=False のとき、空Enterは再入力を促す。
     """
     while True:
@@ -197,24 +292,56 @@ def input_indices(prompt: str, max_index: int, allow_empty=False):
                 return []
             print("  空行は無効です。少なくとも1つは選んでください。")
             continue
+
         out = []
         ok = True
+
         for token in s.split(","):
             token = token.strip()
             if not token:
                 continue
-            try:
-                idx = int(token)
-            except ValueError:
-                print(f"  ⚠ 整数として解釈できません: {token}")
-                ok = False
-                break
-            if not (0 <= idx <= max_index):
-                print(f"  ⚠ 範囲外です: {idx}（0〜{max_index}）")
-                ok = False
-                break
-            out.append(idx)
+
+            # 範囲指定（例: 2-10）
+            if "-" in token:
+                parts = token.split("-")
+                if len(parts) != 2:
+                    print(f"  ⚠ 範囲指定の形式が不正です: {token}（例: 2-10）")
+                    ok = False
+                    break
+                start_str, end_str = parts[0].strip(), parts[1].strip()
+                try:
+                    start = int(start_str)
+                    end = int(end_str)
+                except ValueError:
+                    print(f"  ⚠ 範囲指定を整数として解釈できません: {token}")
+                    ok = False
+                    break
+                if start > end:
+                    print(f"  ⚠ 範囲の順序が逆です: {token}（start ≤ end にしてください）")
+                    ok = False
+                    break
+                if start < 0 or end > max_index:
+                    print(f"  ⚠ 範囲外です: {token}（0〜{max_index} の間で指定してください）")
+                    ok = False
+                    break
+                out.extend(range(start, end + 1))
+            else:
+                # 単一インデックス
+                try:
+                    idx = int(token)
+                except ValueError:
+                    print(f"  ⚠ 整数として解釈できません: {token}")
+                    ok = False
+                    break
+                if not (0 <= idx <= max_index):
+                    print(f"  ⚠ 範囲外です: {idx}（0〜{max_index}）")
+                    ok = False
+                    break
+                out.append(idx)
+
         if ok and out:
+            # 重複は消してソートしておくと気持ちいい
+            out = sorted(set(out))
             return out
 
 def ask_yes_no(prompt: str, default: bool | None = None) -> bool:
@@ -306,6 +433,217 @@ def ensure_xy_columns(df: pd.DataFrame):
     print("y 列に使うカラム番号を指定してください。")
     y_idx = input_indices("y 列インデックス: ", max_idx)[0]
     return df.columns[x_idx], df.columns[y_idx]
+
+
+def inspect_table(path: str, layer_name: str | None = None) -> tuple[list[str], int]:
+    """
+    入力テーブルの「列名リスト」と「総行数」を、可能な限り軽量に取得する。
+    predict モードで、フルロード前に「ざっくりサイズ感」を知るために使う。
+
+    - CSV :
+        * ヘッダーだけ read_csv で取得し、
+        * 行数は生テキストとして行カウント（ヘッダー1行を引く）
+    - GPKG: SQLite を直接叩いて PRAGMA table_info / COUNT(*) で取得
+    - Parquet: pyarrow があればメタデータから取得。なければ fallback として read_parquet
+    - それ以外: read_csv(nrows=100) のような簡易ヘッダー取得に fallback
+
+    戻り値:
+        (columns: list[str], n_rows: int)
+        取得に失敗した場合は ([], 0) を返す。
+    """
+    path = str(path)
+    suffix = Path(path).suffix.lower()
+
+    # -----------------------------
+    # CSV
+    # -----------------------------
+    if suffix == ".csv":
+        # 列名
+        try:
+            cols = pd.read_csv(path, nrows=0).columns.tolist()
+        except Exception as e:
+            print(f"[WARN] inspect_table(csv) で列名取得に失敗しました: {e}")
+            cols = []
+
+        # 行数（ヘッダー行を除外）
+        n_rows = 0
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                # ヘッダーも含めた総行数
+                n_lines = sum(1 for _ in f)
+            n_rows = max(0, n_lines - 1)
+        except Exception as e:
+            print(f"[WARN] inspect_table(csv) で行数取得に失敗しました: {e}")
+        return cols, int(n_rows)
+
+    # -----------------------------
+    # GPKG（GeoPackage = SQLite）
+    # -----------------------------
+    if suffix == ".gpkg":
+        cols: list[str] = []
+        n_rows: int = 0
+        try:
+            conn = sqlite3.connect(path)
+            cur = conn.cursor()
+
+            # レイヤ名が指定されていなければ gpkg_contents から 1つ拾う
+            layer = layer_name
+            if layer is None:
+                try:
+                    cur.execute("SELECT table_name FROM gpkg_contents LIMIT 1;")
+                    row = cur.fetchone()
+                    if row:
+                        layer = row[0]
+                except Exception:
+                    layer = None
+
+            if layer:
+                # 列名
+                cur.execute(f"PRAGMA table_info('{layer}')")
+                cols = [r[1] for r in cur.fetchall()]  # 2列目がカラム名
+
+                # 行数
+                cur.execute(f"SELECT COUNT(*) FROM '{layer}';")
+                row2 = cur.fetchone()
+                if row2:
+                    n_rows = int(row2[0])
+
+            conn.close()
+        except Exception as e:
+            print(f"[WARN] inspect_table(gpkg) でメタ情報取得に失敗しました: {e}")
+        return cols, int(n_rows)
+
+    # -----------------------------
+    # Parquet
+    # -----------------------------
+    if suffix in (".parquet", ".pq"):
+        # pyarrow があればメタデータから高速取得
+        if _pq is not None:
+            try:
+                pf = _pq.ParquetFile(path)
+                cols = pf.schema.names
+                n_rows = int(pf.metadata.num_rows)
+                return list(cols), n_rows
+            except Exception as e:
+                print(f"[WARN] inspect_table(parquet/pyarrow) でメタ情報取得に失敗しました: {e}")
+
+        # fallback: pandas で一旦読み込む（重いが最悪動く）
+        try:
+            df_head = pd.read_parquet(path)
+            return list(df_head.columns), int(len(df_head))
+        except Exception as e:
+            print(f"[WARN] inspect_table(parquet/pandas) でメタ情報取得に失敗しました: {e}")
+            return [], 0
+
+    # -----------------------------
+    # その他のフォーマット
+    # -----------------------------
+    # 「とりあえずヘッダーだけ読んでみる」レベルにとどめる
+    try:
+        df_head = pd.read_csv(path, nrows=100)
+        return list(df_head.columns), int(len(df_head))
+    except Exception as e:
+        print(f"[WARN] inspect_table(その他) でメタ情報取得に失敗しました: {e}")
+        return [], 0
+
+def _read_gpkg_attributes_with_limit(
+    path: str,
+    layer_name: str | None = None,
+    limit: int | None = None,
+) -> pd.DataFrame:
+    """
+    GPKG から「属性テーブルだけ」を読み込むための内部ヘルパ。
+
+    - SQLite 経由で SELECT * FROM "<layer>" を実行し、必要であれば LIMIT を付与する。
+    - geometry 列（geom / geometry）は読み込んだあとにドロップする。
+      → 予測処理では属性だけを使い、
+         出力時にあらためて x,y から geometry を作り直すか、元 GPKG から geometry を使う。    """
+    path = str(path)
+    conn = sqlite3.connect(path)
+    try:
+        cur = conn.cursor()
+
+        layer = layer_name
+        if layer is None:
+            try:
+                cur.execute("SELECT table_name FROM gpkg_contents LIMIT 1;")
+                row = cur.fetchone()
+                if row:
+                    layer = row[0]
+            except Exception:
+                layer = None
+
+        if not layer:
+            raise RuntimeError("GPKG のレイヤ名を特定できませんでした。gpkg_contents が空かもしれません。")
+
+        sql = f'SELECT * FROM "{layer}"'
+        if limit is not None and limit > 0:
+            sql += f" LIMIT {int(limit)}"
+
+        print(f"[INFO] GPKG（属性のみ, limit={limit if limit is not None else 'ALL'}）を読み込み中: {path}")
+        df = pd.read_sql_query(sql, conn)
+    finally:
+        conn.close()
+
+    # geometry 列があれば一旦落とす（予測処理では不要。出力時に改めて geometry を付与する）
+    for gc in ("geom", "geometry"):
+        if gc in df.columns:
+            df = df.drop(columns=[gc])
+    return df
+
+
+def load_table_for_predict(
+    path: str,
+    max_rows: int | None = None,
+    random_state: int = 42,
+) -> tuple[pd.DataFrame, bool]:
+    """
+    予測モード専用のテーブル読み込み関数。
+
+    - GPKG :
+        * SQLite + LIMIT で max_rows 行だけを直接読み込む（先頭から順に）
+        * geometry は内部でドロップし、属性 DataFrame を返す
+    - CSV :
+        * 全件読み込み後、必要なら df.sample(...) でランダムサンプル
+    - Parquet :
+        * 全件読み込み後、必要ならランダムサンプル
+    - その他 :
+        * CSV 相当として read_csv し、必要に応じてランダムサンプル
+
+    戻り値:
+        (df, is_random_sample)
+        is_random_sample=True のときはランダムサンプルで抽出している。
+    """
+    path = str(path)
+    suffix = Path(path).suffix.lower()
+
+    # GPKG は LIMIT で高速に絞り込み
+    if suffix == ".gpkg":
+        df = _read_gpkg_attributes_with_limit(path, layer_name=None, limit=max_rows)
+        return df, False  # 先頭からの抽出なのでランダムサンプルではない
+
+    # CSV
+    if suffix == ".csv":
+        df = pd.read_csv(path)
+        if max_rows is not None and 0 < max_rows < len(df):
+            df = df.sample(n=max_rows, random_state=random_state)
+            return df, True
+        return df, False
+
+    # Parquet
+    if suffix in (".parquet", ".pq"):
+        df = pd.read_parquet(path)
+        if max_rows is not None and 0 < max_rows < len(df):
+            df = df.sample(n=max_rows, random_state=random_state)
+            return df, True
+        return df, False
+
+    # その他（とりあえず CSV として読む）
+    df = pd.read_csv(path)
+    if max_rows is not None and 0 < max_rows < len(df):
+        df = df.sample(n=max_rows, random_state=random_state)
+        return df, True
+    return df, False
 
 
 # =========================================================
@@ -432,46 +770,55 @@ def make_training_data_mode():
             print("数値として解釈できませんでした。終了します。")
             return
         poly_for_extent = None
+
     else:
         if not polygons:
             print("ポリゴンGPKGが見つからないため、手動入力に切り替えます。")
-            return make_training_data_mode()
-
-        # 範囲取得用 GPKG
-        if not poly_for_attr:
-            print("\n[範囲用ポリゴンの選択]")
-            for i, g in enumerate(polygons):
-                print(f"  [P{i:02d}] {g}")
-            p_idx = input("範囲用ポリゴンGPKGの番号（例: 0 または P0。空=0）: ").strip()
-            if p_idx:
-                m = re.fullmatch(r"[Pp](\d+)", p_idx)
-                if m:
-                    p_idx = m.group(1)
             try:
-                p_i = int(p_idx) if p_idx else 0
-            except ValueError:
-                p_i = 0
-            if not (0 <= p_i < len(polygons)):
-                print("番号が不正です。終了します。")
+                xmin = float(input("xmin: ").strip())
+                ymin = float(input("ymin: ").strip())
+                xmax = float(input("xmax: ").strip())
+                ymax = float(input("ymax: ").strip())
+            except Exception:
+                print("数値として解釈できませんでした。終了します。")
                 return
-            poly_for_extent = polygons[p_i]
+            poly_for_extent = None
         else:
-            poly_for_extent = poly_for_attr
+            # 範囲取得用 GPKG
+            if not poly_for_attr:
+                print("\n[範囲用ポリゴンの選択]")
+                for i, g in enumerate(polygons):
+                    print(f"  [P{i:02d}] {g}")
+                p_idx = input("範囲用ポリゴンGPKGの番号（例: 0 または P0。空=0）: ").strip()
+                if p_idx:
+                    m = re.fullmatch(r"[Pp](\d+)", p_idx)
+                    if m:
+                        p_idx = m.group(1)
+                try:
+                    p_i = int(p_idx) if p_idx else 0
+                except ValueError:
+                    p_i = 0
+                if not (0 <= p_i < len(polygons)):
+                    print("番号が不正です。終了します。")
+                    return
+                poly_for_extent = polygons[p_i]
+            else:
+                poly_for_extent = poly_for_attr
 
-        try:
-            layers = fiona.listlayers(poly_for_extent)
-            print(f"  範囲用GPKGのレイヤ一覧: {', '.join(layers)}")
-        except Exception:
-            layers = None
-            print("  （レイヤ一覧の取得に失敗しました）")
+            try:
+                layers = fiona.listlayers(poly_for_extent)
+                print(f"  範囲用GPKGのレイヤ一覧: {', '.join(layers)}")
+            except Exception:
+                layers = None
+                print("  （レイヤ一覧の取得に失敗しました）")
 
-        layer_name = input("  使用レイヤ名（空=最初のレイヤ）: ").strip()
-        if not layer_name and layers:
-            layer_name = layers[0]
+            layer_name = input("  使用レイヤ名（空=最初のレイヤ）: ").strip()
+            if not layer_name and layers:
+                layer_name = layers[0]
 
-        extent_gdf = gpd.read_file(poly_for_extent, layer=layer_name or None)
-        xmin, ymin, xmax, ymax = extent_gdf.total_bounds
-        print(f"  → ポリゴン外接矩形: xmin={xmin:.3f}, ymin={ymin:.3f}, xmax={xmax:.3f}, ymax={ymax:.3f}")
+            extent_gdf = gpd.read_file(poly_for_extent, layer=layer_name or None)
+            xmin, ymin, xmax, ymax = extent_gdf.total_bounds
+            print(f"  → ポリゴン外接矩形: xmin={xmin:.3f}, ymin={ymin:.3f}, xmax={xmax:.3f}, ymax={ymax:.3f}")
 
     # --- 解像度 ---
     res_in = input("\nグリッド解像度（サンプリング間隔、単位は座標系と同じ）[1.0]: ").strip()
@@ -670,20 +1017,24 @@ def train_mode():
     print("\n=== 学習モード（train） ===")
     df, path = load_table_interactive()
 
-    # 行数が多い場合に、先頭 N 行だけを使うオプション
+    # デバッグ・軽量実験用のサンプル制限（任意）
     total_rows = len(df)
     print(f"[INFO] テーブル行数: {total_rows:,}")
+    print("  ※ このあと行うホールドアウト / クロスバリデーションも、")
+    print("     ここで絞った行だけを対象にします。")
+    print("     本番でしっかり精度を評価したい場合は、空Enterで『全件』を使うことを推奨します。")
+    print("     まずは動作確認だけしたい場合に、上限行数を指定してください。")
     max_rows_in = input(
-        "学習に使う最大行数（空=全件, 例: 50000 や 50）: "
+        "学習＋検証に使う行数の上限（空=全件, 例: 50000 や 100000）: "
     ).strip()
     if max_rows_in:
         try:
             max_rows = int(max_rows_in)
             if 0 < max_rows < total_rows:
-                df = df.head(max_rows)
-                print(f"  → 先頭 {max_rows:,} 行のみを学習に使用します。")
+                df = df.sample(n=max_rows, random_state=42)
+                print(f"  → {max_rows:,} 行をランダムサンプリングして学習＋検証に使用します。")
             else:
-                print("  → 全件を使用します。")
+                print("  → 上限行数が全件以上のため、全件を使用します。")
         except ValueError:
             print("  ⚠ 整数として解釈できなかったため、全件を使用します。")
 
@@ -782,6 +1133,19 @@ def train_mode():
         ("imputer", SimpleImputer(strategy="median")),
         ("rf", rf),
     ])
+
+    # -------------------------------
+    # 実験ID (run_id) と出力ディレクトリ
+    # -------------------------------
+    now = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = f"rf_{now}"
+    base = Path(path)
+    out_dir = model_root / f"{base.stem}_{run_id}"
+    model_path = out_dir / f"rf_model_{run_id}.joblib"
+    meta_path  = out_dir / f"rf_meta_{run_id}.json"
+    imp_path   = out_dir / f"rf_feature_importance_{run_id}.csv"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     # -------------------------------
     # 検証ロジック
     # -------------------------------
@@ -822,7 +1186,9 @@ def train_mode():
             n_jobs=-1, return_train_score=False,
         )
 
-        print("\n[CV 結果]")
+        print("\n[評価（OOF = out-of-fold 予測）]")
+        print("  ※ データ全体を対象に、『そのサンプルを学習に使っていないモデル』の予測だけで評価しています。")
+        print("     → 全サンプルが一度ずつテストに回る、厳しめの精度評価です。")        
         for key, label in [
             ("test_accuracy", "Accuracy"),
             ("test_f1_macro", "F1-macro"),
@@ -838,11 +1204,37 @@ def train_mode():
         print("混同行列（行: 真, 列: 予測）:")
         print(cm)
         print("\nclassification_report:")
-        if label_encoder_info:
-            target_names = class_names
-        else:
+
+        # target_names を安全に決定
+        target_names = None
+        if label_encoder_info and class_names:
             target_names = [str(c) for c in class_names]
-        print(classification_report(y, y_oof, target_names=target_names))
+        elif class_names is not None:
+            target_names = [str(c) for c in class_names]
+
+        if target_names is not None:
+            print(classification_report(y, y_oof, target_names=target_names))
+        else:
+            print(classification_report(y, y_oof))
+
+        # 混同行列の図も保存（CV の out-of-fold 予測ベース）
+        if class_names is not None:
+            cm_labels = [str(c) for c in class_names]
+        else:
+            cm_labels = [str(i) for i in range(cm.shape[0])]
+
+        cm_abs_path = out_dir / f"rf_confusion_matrix_{run_id}.png"
+        cm_norm_path = out_dir / f"rf_confusion_matrix_normalized_{run_id}.png"
+        _plot_confusion_matrix(
+            cm, cm_labels, normalize=False,
+            title="Confusion matrix (CV oof)",
+            save_path=cm_abs_path,
+        )
+        _plot_confusion_matrix(
+            cm, cm_labels, normalize=True,
+            title="Confusion matrix (normalized, CV oof)",
+            save_path=cm_norm_path,
+        )
 
         # 最終モデルは全データでフィット
         print("\n[最終モデルの学習（全データで再学習）...]")
@@ -894,11 +1286,39 @@ def train_mode():
         print("混同行列（行: 真, 列: 予測）:")
         print(cm)
         print("\nclassification_report:")
-        if label_encoder_info:
-            target_names = class_names
+
+        if label_encoder_info and class_names:
+            # 学習時に使ったクラスIDをすべて評価対象にする
+            all_labels = np.arange(len(class_names))
+            print(classification_report(
+                y_test,
+                y_pred,
+                labels=all_labels,
+                target_names=[str(c) for c in class_names],
+                zero_division=0,  # support=0 のクラスは 0 扱い＆警告なし
+            ))
         else:
-            target_names = [str(c) for c in class_names]
-        print(classification_report(y_test, y_pred, target_names=target_names))
+            # ラベルエンコーダなしのときはデフォルト挙動でOK
+            print(classification_report(y_test, y_pred))
+
+        # 混同行列の図も保存（ホールドアウトのテストデータベース）
+        if class_names is not None:
+            cm_labels = [str(c) for c in class_names]
+        else:
+            cm_labels = [str(i) for i in range(cm.shape[0])]
+
+        cm_abs_path = out_dir / f"rf_confusion_matrix_{run_id}.png"
+        cm_norm_path = out_dir / f"rf_confusion_matrix_normalized_{run_id}.png"
+        _plot_confusion_matrix(
+            cm, cm_labels, normalize=False,
+            title="Confusion matrix (test)",
+            save_path=cm_abs_path,
+        )
+        _plot_confusion_matrix(
+            cm, cm_labels, normalize=True,
+            title="Confusion matrix (normalized, test)",
+            save_path=cm_norm_path,
+        )
 
         eval_mode = "holdout"
         eval_info = {
@@ -906,45 +1326,45 @@ def train_mode():
             "use_stratify": use_stratify,
         }
 
-    # 実験ID (run_id)
-    now = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_id = f"rf_{now}"
+    # モデル保存パラメータまとめ
+    train_params = {
+        "random_state": random_state,
+        "n_estimators": n_estimators,
+        "max_depth": max_depth,
+        "class_weight": class_weight,
+    }
+    if eval_mode == "holdout":
+        train_params["test_size"] = test_size
 
-    # 保存ディレクトリ
-    # 先に決めた model_root の下に <元テーブル名>_<run_id> フォルダを掘る
-    # （train_mode 冒頭で base / model_root を定義済み）
-    out_dir = model_root / f"{base.stem}_{run_id}"
-    model_path = out_dir / f"rf_model_{run_id}.joblib"
-    meta_path  = out_dir / f"rf_meta_{run_id}.json"
-    imp_path   = out_dir / f"rf_feature_importance_{run_id}.csv"
-
-    # モデル保存
-    joblib.dump(pipe, model_path)
-    print(f"\n[保存] モデル: {model_path}")
-
-    # メタ情報 JSON
+    # メタ情報 JSON 本体
     meta = {
         "run_id": run_id,
         "source_path": str(path),
         "target_col": target_col,
         "feature_cols": feature_cols,
-        "class_names": target_names,
+        "class_names": class_names,
         "label_encoder": label_encoder_info,
         "validation": {
             "mode": eval_mode,
             **eval_info,
         },
-        "train_params": {
-            "test_size": test_size,
-            "random_state": random_state,
-            "n_estimators": n_estimators,
-            "max_depth": max_depth,
-            "class_weight": class_weight,
-        },
+        "train_params": train_params,
     }
+
+    # 既存: run_id 付きのファイル
+    joblib.dump(pipe, model_path)
+    print(f"\n[保存] モデル: {model_path}")
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
     print(f"[保存] メタ情報: {meta_path}")
+
+    # オプション: 直近モデルへのショートカット
+    latest_model = model_root / "rf_model.joblib"
+    latest_meta  = model_root / "rf_meta.json"
+    joblib.dump(pipe, latest_model)
+    with open(latest_meta, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    print(f"[保存] 直近モデル: {latest_model}")
 
     # 特徴量重要度
     rf_trained: RandomForestClassifier = pipe.named_steps["rf"]
@@ -970,49 +1390,9 @@ def train_mode():
     plt.close(fig)
     print(f"[保存] 特徴量重要度 図: {fig_path}")
 
-    # 混同行列の図（絶対値 & 行正規化）
-    def _plot_confusion_matrix(cm, normalize=False, title="Confusion matrix", cmap=None, save_path=None):
-        if normalize:
-            cmn = cm.astype(float) / cm.sum(axis=1, keepdims=True)
-            cm_plot = cmn
-        else:
-            cm_plot = cm
-
-        fig, ax = plt.subplots(figsize=(6, 5))
-        im = ax.imshow(cm_plot, interpolation="nearest", cmap=cmap or "Blues")
-        ax.figure.colorbar(im, ax=ax)
-        ax.set_title(title)
-        tick_marks = np.arange(len(target_names))
-        ax.set_xticks(tick_marks)
-        ax.set_xticklabels(target_names, rotation=45, ha="right")
-        ax.set_yticks(tick_marks)
-        ax.set_yticklabels(target_names)
-        ax.set_ylabel("True label")
-        ax.set_xlabel("Predicted label")
-
-        fmt = ".2f" if normalize else "d"
-        thresh = cm_plot.max() / 2.0
-        for i in range(cm_plot.shape[0]):
-            for j in range(cm_plot.shape[1]):
-                ax.text(
-                    j, i, format(cm_plot[i, j], fmt),
-                    ha="center", va="center",
-                    color="white" if cm_plot[i, j] > thresh else "black",
-                )
-        fig.tight_layout()
-        if save_path is not None:
-            fig.savefig(save_path, dpi=150)
-            print(f"[保存] 混同行列 図: {save_path}")
-        plt.close(fig)
-
-    cm_abs_path = out_dir / f"rf_confusion_matrix_{run_id}.png"
-    cm_norm_path = out_dir / f"rf_confusion_matrix_normalized_{run_id}.png"
-    _plot_confusion_matrix(cm, normalize=False,
-                           title="Confusion matrix (test)",
-                           save_path=cm_abs_path)
-    _plot_confusion_matrix(cm, normalize=True,
-                           title="Confusion matrix (normalized, test)",
-                           save_path=cm_norm_path)
+    latest_imp = model_root / "rf_feature_importance.csv"
+    imp_df.to_csv(latest_imp, index=False, encoding="utf-8")
+    print(f"[保存] 直近特徴量重要度 CSV: {latest_imp}")
 
     print("\n[完了] 学習モードが正常に終了しました。")
 
@@ -1055,32 +1435,105 @@ def predict_mode():
     class_names = meta.get("class_names")
     label_encoder_info = meta.get("label_encoder")
 
-    df, in_path = load_table_interactive()
+    # まずは入力テーブルのパスだけを取得
+    in_path = input("入力テーブルのパス（CSV/Parquet/GPKG）: ").strip().strip('"')
+    if not in_path:
+        print("  ⚠ 入力テーブルのパスが空です。中断します。")
+        return
+    if not os.path.exists(in_path):
+        print(f"  ⚠ 入力ファイルが見つかりません: {in_path}")
+        return
 
-    # 行数が多い場合に、先頭 N 行だけを使うオプション
-    total_rows = len(df)
-    print(f"[INFO] テーブル行数: {total_rows:,}")
+    # テーブル全体の行数・列数を inspect_table で軽量に確認
+    cols_meta, total_rows = inspect_table(in_path)
+    if total_rows > 0:
+        print(f"[INFO] テーブル行数: {total_rows:,}（inspect_table による推定）")
+        if cols_meta:
+            print(f"[INFO] 列数: {len(cols_meta)} 列（inspect_table）")
+    else:
+        print("[WARN] inspect_table でテーブル行数を取得できませんでした。読み込み後に行数を算出します。")
+        total_rows = None
+
+    # 何行予測するかをここで決める（GPKG の場合は LIMIT で読み込み行数を削減）
+    print("  ※ 本番での利用を想定する場合は、空Enterで『全件』に対して予測を行うことを推奨します。")
+    print("     まずは動作確認だけしたい場合に、ここで行数の上限を指定してください。")
+    max_rows = None
     max_rows_in = input(
-        "予測に使う最大行数（空=全件, 例: 50）: "
+        "予測結果を出力する行数の上限（空=全件, 例: 50000 や 100000）: "
     ).strip()
     if max_rows_in:
         try:
-            max_rows = int(max_rows_in)
-            if 0 < max_rows < total_rows:
-                df = df.head(max_rows)
-                print(f"  → 先頭 {max_rows:,} 行のみを予測に使用します。")
+            req = int(max_rows_in)
+            if req <= 0:
+                print("  → 0 以下は指定できません。全件を対象に予測します。")
             else:
-                print("  → 全件を使用します。")
+                if total_rows is not None and req >= total_rows:
+                    print("  → 上限行数が全件以上のため、全件を対象に予測します。")
+                else:
+                    max_rows = req
         except ValueError:
-            print("  ⚠ 整数として解釈できなかったため、全件を使用します。")
+            print("  ⚠ 整数として解釈できなかったため、全件を対象に予測します。")
 
-    # 評価結果の出力用プレフィックス（元テーブル名 + run_id）
+    # 実際のテーブル読み込み（GPKG の場合は LIMIT 付きで高速化）
+    df, is_random_sample = load_table_for_predict(in_path, max_rows=max_rows, random_state=42)
+    if total_rows is None:
+        total_rows = len(df)
+        print(f"[INFO] テーブル行数: {total_rows:,}")
+
+    if max_rows is None:
+        print(f"  → 全 {len(df):,} 行を対象に予測します。")
+    else:
+        if is_random_sample:
+            print(f"  → {len(df):,} 行をランダムサンプリングして予測します。")
+            print("     出力される予測ファイルにも、このサンプルされた行のみが含まれます。")
+        else:
+            print(f"  → {len(df):,} 行のみを読み込んで予測します（先頭から順に抽出）。")
+            print("     出力される予測ファイルにも、この抽出された行のみが含まれます。")
+
+    # 評価結果の出力用に run_id だけ先に取得
+    # （実際の eval_prefix は、予測出力 out_path が決まってから組み立てる）
     base_in = str(Path(in_path).with_suffix(""))
     run_id = meta.get("run_id", "predict")
-    eval_prefix = f"{base_in}_eval_{run_id}"
+
+    # =====================================================
+    # 予測結果の保存先を「最初に」決めておく
+    # =====================================================
+    low_in = in_path.lower()
+    if low_in.endswith(".csv"):
+        default_out_path = f"{base_in}_pred_{run_id}.csv"
+    elif low_in.endswith(".parquet") or low_in.endswith(".pq"):
+        default_out_path = f"{base_in}_pred_{run_id}.parquet"
+    elif low_in.endswith(".gpkg"):
+        default_out_path = f"{base_in}_pred_{run_id}.gpkg"
+    else:
+        default_out_path = f"{base_in}_pred_{run_id}.csv"
+
+    print("\n[出力先の設定]")
+    print(f"  デフォルト: {default_out_path}")
+    out_path = input(
+        "予測結果の保存先パス（空=上記デフォルト。拡張子を含めて指定可。"
+        "ディレクトリのみ指定した場合は、その中にデフォルト名で保存）: "
+    ).strip()
+    if not out_path:
+        out_path = default_out_path
+    else:
+        # ユーザーがディレクトリを指定した場合の扱い
+        p = Path(out_path)
+        # 既存ディレクトリ、または末尾が / or \ の場合は「ディレクトリ指定」とみなす
+        if p.is_dir() or out_path.endswith(("/", "\\")):
+            out_path = str(p / Path(default_out_path).name)
+            print(f"  → ディレクトリ指定と判断し、{out_path} に保存します。")
+    print(f"  → 予測結果は {out_path} に保存されます。")
+
+    # ここまでで out_path（予測結果を書き出すパス）が決まっている前提
+    # 評価結果の出力用プレフィックスも、その out_path と同じディレクトリに揃える
+    #   例）/.../predict/B/train_MeB_pred_rf_xxx.gpkg
+    #        → /.../predict/B/train_MeB_pred_rf_xxx_eval_confusion_matrix.csv など
+    base_out = str(Path(out_path).with_suffix(""))
+    eval_prefix = f"{base_out}_eval"
 
     # 入力GPKGのCRSを取得（あれば、後の ask_crs の既定値に使う）
-    source_crs_str = None
+    source_crs_str = None    # ★ dfは属性のみ読み込み済みなので、ここで別途読む
     if in_path.lower().endswith(".gpkg"):
         try:
             gdf_src = _read_gpkg_with_geom(in_path)
@@ -1089,6 +1542,52 @@ def predict_mode():
                 print(f"[INFO] 入力GPKGのCRS: {source_crs_str}")
         except Exception as e:
             print(f"[WARN] 入力GPKGのCRS取得に失敗しました: {e}")
+
+    # =====================================================
+    # モデル側クラスと入力テーブル側ラベルの「事前確認」
+    # =====================================================
+    print("\n[モデル側クラス一覧（このモデルが出力し得るラベル）]")
+    if class_names:
+        for i, cname in enumerate(class_names):
+            print(f"  [{i:02d}] {cname}")
+    else:
+        print("  （meta に class_names が無いため、クラス一覧は表示できません）")
+
+    if target_col in df.columns:
+        data_labels = sorted(set(df[target_col].dropna().astype(str)))
+        print("\n[入力テーブル側のラベル一覧（ユニーク）]")
+        for v in data_labels:
+            print(f"  - {v}")
+
+        if class_names:
+            model_set = set(str(c) for c in class_names)
+            data_set = set(data_labels)
+
+            missing_in_data = sorted(model_set - data_set)
+            extra_in_data   = sorted(data_set - model_set)
+
+            print("\n[ラベル差分チェック]")
+            if missing_in_data:
+                print("  ・モデルには存在するが、このテーブルには出現していないラベル:")
+                for v in missing_in_data:
+                    print(f"      - {v}")
+            else:
+                print("  ・モデルにあって、このテーブルに無いラベル: なし")
+
+            if extra_in_data:
+                print("  ・テーブル側にあるが、モデルが学習していないラベル:")
+                for v in extra_in_data:
+                    print(f"      - {v}")
+            else:
+                print("  ・テーブル側にあって、モデルに無いラベル: なし")
+        else:
+            print("\n[注意] meta に class_names が無いため、差分の機械的チェックは行いません。")
+
+        input("\nラベル一覧と差分を確認しました。続行するには Enter を押してください（中止=Ctrl+C）: ")
+    else:
+        print(f"\n[注意] 入力テーブルに target_col='{target_col}' 列が無いため、")
+        print("       今回は評価（混同行列・classification_report）は行われません。")
+        input("モデルのクラス一覧だけ確認しました。続行するには Enter を押してください（中止=Ctrl+C）: ")
 
     # 特徴量列の整合性チェック
     print("\n[特徴量列の整合性チェック]")
@@ -1135,9 +1634,8 @@ def predict_mode():
     else:
         proba_max = None
 
-    # ラベルを元に戻す
+    # ラベルを元に戻す（予測側）
     if label_encoder_info and class_names:
-        # 予測は整数 → クラス名
         y_pred_labels = [class_names[int(i)] for i in y_pred]
     else:
         y_pred_labels = y_pred
@@ -1147,19 +1645,25 @@ def predict_mode():
     if proba_max is not None:
         out["proba_max"] = proba_max
 
-    # 後で confusion matrix / classification_report を CSV に出すためのフラグ
-    saved_eval = False
+    saved_eval = False  # 評価結果をファイル出力したかどうか
 
-    # 正解ラベルがあれば評価
+    # =====================================================
+    # 正解ラベルがあれば評価 ＆ ラベル対応チェック
+    # =====================================================
     if target_col in df.columns:
         print("\n[評価（入力テーブルに正解ラベルが含まれていたため）]")
-        y_true = df[target_col].values
+        y_true_raw = df[target_col].values
 
-        # 文字列 vs 整数の可能性があるので揃える
+        # ---------------------------
+        # LabelEncoder を使っていた場合
+        # ---------------------------
         if label_encoder_info and class_names:
-            # ---- 正解ラベル → 学習時クラスID へのマッピングを少し頑丈に ----
-            # ・学習時クラス名を str + strip() で正規化
-            # ・"01001" と 1001 のようなケースに備えて int(str) もキー登録
+            # --- 学習時クラスの一覧 ---
+            print("\n[学習時クラス一覧]")
+            for i, cname in enumerate(class_names):
+                print(f"  [{i:02d}] {cname}")
+
+            # 学習時クラス名 → クラスIDの辞書（文字列ベース＋int文字列ベース）
             norm_to_idx: dict[str, int] = {}
             for idx, name in enumerate(class_names):
                 s = str(name).strip()
@@ -1170,8 +1674,41 @@ def predict_mode():
                 except Exception:
                     pass
 
+            # 予測テーブル側ラベル（生のユニーク値）
+            raw_labels = sorted({str(v).strip() for v in y_true_raw})
+            print("\n[評価対象テーブル側のラベル一覧（ユニーク）]")
+            for s in raw_labels:
+                print(f"  - {s}")
+
+            # 自動では拾えないラベル
+            unmatched = [lab for lab in raw_labels if lab not in norm_to_idx]
+
+            if unmatched:
+                print("\n⚠ 自動マッピングでは対応が見つからないラベルがあります。")
+                print("  対応させたい学習クラスがあれば、番号を指定してください。")
+                print("  何も入力せずEnter → 評価から除外（その行は無視）")
+                print("")
+                for lab in unmatched:
+                    print(f"  未対応ラベル: {lab}")
+                    ans = input("    対応する学習クラス番号（空=除外）: ").strip()
+                    if ans == "":
+                        print("    → このラベルは評価から除外します。")
+                        continue
+                    try:
+                        idx = int(ans)
+                        if 0 <= idx < len(class_names):
+                            target_name = class_names[idx]
+                            print(f"    → {lab} を '{target_name}' として扱います。")
+                            norm_to_idx[lab] = idx
+                        else:
+                            print("    ⚠ 範囲外の番号です。このラベルは除外します。")
+                        # 失敗しても除外扱い
+                    except ValueError:
+                        print("    ⚠ 整数として解釈できません。このラベルは除外します。")
+
+            # --- 最終的なマッピング ---
             mapped = []
-            for v in y_true:
+            for v in y_true_raw:
                 s = str(v).strip()
                 if s in norm_to_idx:
                     mapped.append(norm_to_idx[s])
@@ -1180,42 +1717,54 @@ def predict_mode():
 
             y_true_int = np.array(mapped, dtype=int)
             valid_mask = y_true_int >= 0
-            unmatched = int((~valid_mask).sum())
+            unmatched_count = int((~valid_mask).sum())
 
-            if unmatched > 0:
-                print(f"  ⚠ 正解ラベルのうち {unmatched} 件は学習時クラスとマッチしなかったため、評価から除外しました。")
+            if unmatched_count > 0:
+                print(f"\n  ⚠ 正解ラベルのうち {unmatched_count} 件は学習時クラスとマッチしなかったため、評価から除外しました。")
 
             if not np.any(valid_mask):
                 print("  ⚠ 有効な正解ラベルが 1 件もなかったため、評価をスキップします。")
             else:
                 y_true_valid = y_true_int[valid_mask]
                 y_pred_valid = y_pred[valid_mask]
-                cm = confusion_matrix(y_true_valid, y_pred_valid)
+
+                # ★ ここで labels= 全クラスID を明示しておく
+                all_labels = np.arange(len(class_names))
+
+                # 混同行列
+                cm = confusion_matrix(y_true_valid, y_pred_valid, labels=all_labels)
                 print("混同行列（行: 真, 列: 予測）:")
                 print(cm)
+
                 print("\nclassification_report:")
                 print(classification_report(
-                    y_true_valid, y_pred_valid,
-                    target_names=class_names,
+                    y_true_valid,
+                    y_pred_valid,
+                    labels=all_labels,
+                    target_names=[str(c) for c in class_names],
+                    zero_division=0,  # support=0 のクラスは 0 として扱い、警告を出さない
                 ))
 
                 # --- 評価結果をファイル出力 ---
                 try:
-                    # 混同行列を CSV へ
+                    # 混同行列 CSV（全クラス分）
                     cm_df = pd.DataFrame(
                         cm,
-                        index=class_names,
-                        columns=class_names,
+                        index=[str(c) for c in class_names],
+                        columns=[str(c) for c in class_names],
                     )
                     cm_path = f"{eval_prefix}_confusion_matrix.csv"
                     cm_df.to_csv(cm_path, encoding="utf-8-sig")
                     print(f"  → 混同行列を保存しました: {cm_path}")
 
-                    # classification_report を CSV へ
+                    # classification_report CSV
                     rep_dict = classification_report(
-                        y_true_valid, y_pred_valid,
-                        target_names=class_names,
+                        y_true_valid,
+                        y_pred_valid,
+                        labels=all_labels,
+                        target_names=[str(c) for c in class_names],
                         output_dict=True,
+                        zero_division=0,
                     )
                     rep_df = pd.DataFrame(rep_dict).T
                     rep_path = f"{eval_prefix}_classification_report.csv"
@@ -1226,41 +1775,52 @@ def predict_mode():
                 except Exception as e:
                     print(f"  ⚠ 評価結果の保存に失敗しました: {e}")
 
+        # ---------------------------
+        # LabelEncoder 未使用の場合
+        # ---------------------------
         else:
-            # ラベルエンコーダを使っていない場合は、そのまま比較
-            cm = confusion_matrix(y_true, y_pred_labels)
+            y_true = y_true_raw
+            # class_names があればそれを「全クラス」とみなす
+            if class_names:
+                all_labels = list(class_names)
+                rep_target_names = [str(c) for c in all_labels]
+            else:
+                # なければ今回のデータに出てきたクラスだけでやる
+                uniq = sorted(pd.unique(y_true))
+                all_labels = list(uniq)
+                rep_target_names = [str(u) for u in uniq]
+
+            cm = confusion_matrix(y_true, y_pred_labels, labels=all_labels)
             print("混同行列（行: 真, 列: 予測）:")
             print(cm)
+
             print("\nclassification_report:")
             print(classification_report(
-                y_true, y_pred_labels,
-                target_names=class_names if class_names else None,
+                y_true,
+                y_pred_labels,
+                labels=all_labels,
+                target_names=rep_target_names,
+                zero_division=0,
             ))
 
             # --- 評価結果をファイル出力 ---
             try:
-                if class_names:
-                    idx_names = class_names
-                    rep_target_names = class_names
-                else:
-                    # クラス名が無い場合はユニーク値をソートして名前にする
-                    uniq = sorted(pd.unique(y_true))
-                    idx_names = [str(u) for u in uniq]
-                    rep_target_names = idx_names
-
                 cm_df = pd.DataFrame(
                     cm,
-                    index=idx_names,
-                    columns=idx_names,
+                    index=[str(c) for c in all_labels],
+                    columns=[str(c) for c in all_labels],
                 )
                 cm_path = f"{eval_prefix}_confusion_matrix.csv"
                 cm_df.to_csv(cm_path, encoding="utf-8-sig")
                 print(f"  → 混同行列を保存しました: {cm_path}")
 
                 rep_dict = classification_report(
-                    y_true, y_pred_labels,
+                    y_true,
+                    y_pred_labels,
+                    labels=all_labels,
                     target_names=rep_target_names,
                     output_dict=True,
+                    zero_division=0,
                 )
                 rep_df = pd.DataFrame(rep_dict).T
                 rep_path = f"{eval_prefix}_classification_report.csv"
@@ -1271,10 +1831,11 @@ def predict_mode():
             except Exception as e:
                 print(f"  ⚠ 評価結果の保存に失敗しました: {e}")
 
-    # 予測結果のクラスごとの件数サマリも必ず出力
+    # =====================================================
+    # 予測クラスの件数サマリ（常に出力）
+    # =====================================================
     try:
         if label_encoder_info and class_names:
-            # y_pred は整数クラスID
             tmp = pd.DataFrame({"cls_id": y_pred})
             grp = tmp.groupby("cls_id").size().sort_index()
             cls_labels = [class_names[int(i)] for i in grp.index]
@@ -1288,7 +1849,6 @@ def predict_mode():
             "count": grp.values,
         })
         if proba_max is not None:
-            # クラス別の平均最大確率
             if label_encoder_info and class_names:
                 tmp2 = pd.DataFrame({"cls_id": y_pred, "proba_max": proba_max})
                 gm = tmp2.groupby("cls_id")["proba_max"].mean().reindex(grp.index)
@@ -1303,27 +1863,17 @@ def predict_mode():
     except Exception as e:
         print(f"\n  ⚠ 予測サマリの保存に失敗しました: {e}")
 
-    # 出力ファイル名
-    out_path = input(f"\n予測結果の保存先（空なら {base_in}_pred_{run_id}.ext）: ").strip()
-    if not out_path:
-        # 入力の拡張子に応じて自動決定
-        low = in_path.lower()
-        if low.endswith(".csv"):
-            out_path = f"{base_in}_pred_{run_id}.csv"
-        elif low.endswith(".parquet") or low.endswith(".pq"):
-            out_path = f"{base_in}_pred_{run_id}.parquet"
-        elif low.endswith(".gpkg"):
-            out_path = f"{base_in}_pred_{run_id}.gpkg"
-        else:
-            out_path = f"{base_in}_pred_{run_id}.csv"
-
+    # =====================================================
+    # 予測結果テーブルの保存（CSV / Parquet / GPKG）
+    #   ※ out_path は関数冒頭で既に決定済み
+    # =====================================================
     low = out_path.lower()
     if low.endswith(".csv"):
         out.to_csv(out_path, index=False, encoding="utf-8")
         print(f"\n✅ 予測結果（CSV）を書き出しました: {out_path}")
 
     elif low.endswith(".gpkg"):
-        # 出力GPKGの場合、x,y列を使ってポイントにするかどうか確認
+        # 出力GPKGの場合、geometry を使うか / x,y から作るか
         if "geometry" in out.columns:
             use_geom = ask_yes_no("入力に geometry 列があるので、そのままGPKGに書き出しますか？", default=True)
         else:
@@ -1331,7 +1881,6 @@ def predict_mode():
 
         if use_geom:
             gtmp = gpd.GeoDataFrame(out, geometry="geometry")
-            # 入力GPKGのCRS or geometryのCRS を既定値にする
             default_crs = source_crs_str or (str(gtmp.crs) if gtmp.crs else "EPSG:4326")
             crs = ask_crs(default_epsg=default_crs)
             gtmp.set_crs(crs, inplace=True)
@@ -1339,7 +1888,6 @@ def predict_mode():
             gtmp.to_file(out_path, driver="GPKG", layer=layer_name)
             print(f"\n✅ 予測結果（GPKG）を書き出しました: {out_path}（レイヤ: {layer_name}, CRS={crs}）")
         else:
-            # x,y 列があればそこから点を作る
             if {"x", "y"}.issubset(out.columns):
                 default_crs = source_crs_str or "EPSG:4326"
                 crs = ask_crs(default_epsg=default_crs)
@@ -1363,10 +1911,9 @@ def predict_mode():
             out.to_csv(out_fallback, index=False, encoding="utf-8")
             print(f"\n✅ 予測結果（CSV）を書き出しました: {out_fallback}")
     else:
-        # よく分からない拡張子 → CSV にフォールバック
-        fallback = f"{base_in}_pred_{run_id}.csv"
-        out.to_csv(fallback, index=False, encoding="utf-8")
-        print(f"\n✅ 予測結果（CSV）を書き出しました: {fallback}")
+        # 拡張子が不明な場合も、そのまま CSV として扱う
+        out.to_csv(out_path, index=False, encoding="utf-8")
+        print(f"\n✅ 予測結果（CSV）を書き出しました: {out_path}")
 
     print("\n[完了] 予測モードが正常に終了しました。")
 
