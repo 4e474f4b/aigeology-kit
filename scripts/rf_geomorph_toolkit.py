@@ -93,7 +93,7 @@ rf_geomorph_toolkit.py
 
 この docstring を見れば、
   * 学習用テーブルの作り方（ラスター＋ポリゴン → グリッドサンプリング）
-  * 検証方法（ホールドアウト / k-分割CV）の違い
+  * 検証方法（ホールドアウト / Monte Carlo CV / k-分割CV）の違い
   * random_state / 層化サンプリング / class_weight の意味
   * 予測モードでの高速ローダー（GPKG=SQLite LIMIT / CSV・Parquet=ランダムサンプル）の挙動
   * モデルファイルや評価ファイルがどこに・どのファイル名で出るか
@@ -137,8 +137,6 @@ from sklearn.preprocessing import LabelEncoder
 import joblib
 
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
-from matplotlib.ticker import MaxNLocator
 import geopandas as gpd
 
 try:
@@ -154,7 +152,6 @@ import fiona
 # =========================================================
 def save_gpkg_with_points(df, out_path, x_col="x", y_col="y",
                           crs_epsg="EPSG:4326", layer_name="pred"):
-    import geopandas as gpd
     from shapely.geometry import Point
 
     if x_col not in df.columns or y_col not in df.columns:
