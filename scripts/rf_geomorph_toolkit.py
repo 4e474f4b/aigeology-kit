@@ -29,9 +29,12 @@ rf_geomorph_toolkit.py
       1) ホールドアウト法（学習/テストに分割）
           - データを「学習用」と「テスト用」に 1 回だけ分割。
           - `テストデータ割合` でテスト側に回す比率を指定（例: 0.2 ⇒ 8:2）。
-      2) k-分割クロスバリデーション
+      2) Monte Carlo Cross-Validation法（モンテカルロCV）
+          - 毎回ランダムに学習/テストに分割し、その評価を n 回平均する方式。
+          - `テストデータ割合` と `n_splits` でテスト比率と繰り返し回数を指定。
+      3) k-fold Cross-Validation法（k分割CV）
           - データ全体を k 個に分割し、k 回学習・検証を繰り返す。
-          - `k-分割数` で k を指定（例: 5 ⇒ 5-fold CV）。
+          - `k-分割数` で k を指定（例: 5 ⇒ 5-fold CV）。      
 
     [主なパラメータの意味]
       - random_state:
@@ -115,7 +118,14 @@ import numpy as np
 import pandas as pd
 
 from sklearn.model_selection import (
-    train_test_split, StratifiedKFold, KFold, cross_validate, cross_val_predict)
+    train_test_split,
+    StratifiedKFold,
+    KFold,
+    StratifiedShuffleSplit,
+    ShuffleSplit,
+    cross_validate,
+    cross_val_predict,
+)
 from sklearn.metrics import (
     confusion_matrix,
     classification_report,
@@ -1076,8 +1086,9 @@ def train_mode():
     # -------------------------------
     print("\n[検証方法の選択]")
     print("  1) ホールドアウト法（学習/テストに分割）")
-    print("  2) k-分割クロスバリデーション")
-    val_mode = input("番号を選択してください [1/2]（空=1）: ").strip() or "1"
+    print("  2) Monte Carlo Cross-Validation法（モンテカルロCV）")
+    print("  3) k-fold Cross-Validation法（k分割CV）")
+    val_mode = input("番号を選択してください [1-3]（空=1）: ").strip() or "1"
 
     # 共通: random_state
     random_state = input("random_state（空=42）: ").strip()
@@ -1150,6 +1161,94 @@ def train_mode():
     # 検証ロジック
     # -------------------------------
     if val_mode == "2":
+        # ===== Monte Carlo Cross-Validation =====
+        print("\n[Monte Carlo Cross-Validation 設定]")
+        n_splits_in = input("繰り返し回数 n_splits（空=10）: ").strip()
+        if n_splits_in:
+            try:
+                n_splits = int(n_splits_in)
+            except ValueError:
+                print("  ⚠ 整数変換に失敗したので 10 を使います。")
+                n_splits = 10
+        else:
+            n_splits = 10
+
+        if n_splits < 2:
+            print("  ⚠ n_splits は 2 以上が必要なので 10 を使います。")
+            n_splits = 10
+
+        # Monte Carlo でもテスト比率は指定したいので、ここで入力
+        test_size_in = input("テストデータ割合 test_size（0〜0.5 程度, 空=0.2）: ").strip()
+        if test_size_in:
+            try:
+                test_size = float(test_size_in)
+            except ValueError:
+                print("  ⚠ 数値変換に失敗したので 0.2 を使います。")
+                test_size = 0.2
+        else:
+            test_size = 0.2
+
+        if not (0.0 < test_size < 0.5):
+            print("  ⚠ 0〜0.5 の範囲外なので 0.2 を使います。")
+            test_size = 0.2
+
+        if use_stratify:
+            cv = StratifiedShuffleSplit(
+                n_splits=n_splits,
+                test_size=test_size,
+                random_state=random_state,
+            )
+        else:
+            cv = ShuffleSplit(
+                n_splits=n_splits,
+                test_size=test_size,
+                random_state=random_state,
+            )
+
+        scoring = {
+            "accuracy": "accuracy",
+            "f1_macro": "f1_macro",
+            "f1_weighted": "f1_weighted",
+        }
+        cv_result = cross_validate(
+            pipe, X, y, cv=cv, scoring=scoring,
+            n_jobs=-1, return_train_score=False,
+        )
+
+        print("\n[評価（Monte Carlo Cross-Validation）]")
+        print("  ※ ランダム分割を複数回行い、その平均スコアを表示します。")
+        for key, label in [
+            ("test_accuracy", "Accuracy"),
+            ("test_f1_macro", "F1-macro"),
+            ("test_f1_weighted", "F1-weighted"),
+        ]:
+            vals = cv_result[key]
+            print(f"  {label}: {vals.mean():.4f} ± {vals.std():.4f} (n={len(vals)})")
+
+        # Monte Carlo CV では、各サンプルがテストに出る回数が一定でないため、
+        # cross_val_predict による OOF 混同行列は作らず、スコアの平均のみ保存。
+
+        # 最終モデルは全データでフィット
+        print("\n[最終モデルの学習（全データで再学習）...]")
+        pipe.fit(X, y)
+        print("学習完了。")
+
+        eval_mode = "montecarlo"
+        eval_info = {
+            "cv_n_splits": n_splits,
+            "test_size": test_size,
+            "use_stratify": use_stratify,
+            "scores": {
+                "accuracy_mean": float(cv_result["test_accuracy"].mean()),
+                "accuracy_std": float(cv_result["test_accuracy"].std()),
+                "f1_macro_mean": float(cv_result["test_f1_macro"].mean()),
+                "f1_macro_std": float(cv_result["test_f1_macro"].std()),
+                "f1_weighted_mean": float(cv_result["test_f1_weighted"].mean()),
+                "f1_weighted_std": float(cv_result["test_f1_weighted"].std()),
+            },
+        }
+
+    elif val_mode == "3":
         # ===== k-分割クロスバリデーション =====
         print("\n[クロスバリデーション設定]")
         k_in = input("k-分割数（空=5）: ").strip()
@@ -1188,7 +1287,7 @@ def train_mode():
 
         print("\n[評価（OOF = out-of-fold 予測）]")
         print("  ※ データ全体を対象に、『そのサンプルを学習に使っていないモデル』の予測だけで評価しています。")
-        print("     → 全サンプルが一度ずつテストに回る、厳しめの精度評価です。")        
+        print("     → 全サンプルが一度ずつテストに回る、厳しめの精度評価です。")
         for key, label in [
             ("test_accuracy", "Accuracy"),
             ("test_f1_macro", "F1-macro"),
@@ -1333,7 +1432,8 @@ def train_mode():
         "max_depth": max_depth,
         "class_weight": class_weight,
     }
-    if eval_mode == "holdout":
+    # Monte Carlo も test_size を持つので、メタ情報に含める
+    if eval_mode in ("holdout", "montecarlo"):
         train_params["test_size"] = test_size
 
     # メタ情報 JSON 本体
