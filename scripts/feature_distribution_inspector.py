@@ -1,363 +1,277 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-feature_distribution_inspector.py
+特徴量分布の事前チェック用ツール。
 
-ランダムフォレスト等に与える「特徴量（説明変数）」の分布傾向を確認するためのツール。
+モード:
+  1) 単変量分布の確認
+      - 数値列: ヒストグラム PNG + 基本統計量 CSV
+      - 文字列列: value_counts CSV + 棒グラフ PNG
+  2) ペアワイズ WMW + AUC 解析
+      - ラベル列を 1 つ選び、クラスペアごと × 特徴量ごとに
+        Mann-Whitney U 検定 + AUC（+オプションで Cliff's δ）を計算
+      - 結果をロング形式 CSV + AUC 行列 CSV として出力
 
-機能概要
---------
-- gpkg / parquet / csv のいずれか 1 ファイルを読み込み、
-- 対話的に列を選択し（番号 + 範囲指定 2-6, 1-3,7 などに対応）、
-- 列ごとに「数値 / 数値変換 / カテゴリ / IDライク」を自動判定し、
-  - 数値/数値変換列: ヒストグラム + 基本統計量 CSV
-  - カテゴリ列: 棒グラフ + value_counts CSV
-  - IDライク列: デフォルトではスキップ
-- 閾値（数値変換割合・カテゴリ判定のユニーク数）も対話的に設定可能。
-- 日本語フォントが見つからない場合は、ユーザーに対応方法を確認。
-- 出力フォルダは、デフォルト（入力ファイルと同じ場所にタイムスタンプ付きサブフォルダ）を提示しつつ、
-  ユーザーが任意のパスを指定可能。
+【モード1（単変量分布）の出力ファイル仕様】
 
-想定環境
---------
-- OS: Windows 11 / macOS
-- Python: 3.11
-- 仮想環境: terrain-env / aigeology-env など（mamba 管理を想定）
-- 主なライブラリ: pandas, pyarrow, geopandas（任意）, matplotlib
+  入力ファイルごとに 1 つの出力フォルダが作成され、その中に
+  各列ごとの画像 / CSV が保存される。
+
+  1. 数値列のヒストグラム PNG
+
+     - ファイル名:
+         <列名>_hist.png
+       例: TEST1mDEM1k_epsg6673_slope_deg_r25m_gauss_b1_hist.png
+
+     - 中身:
+         x軸 : 対象列の値
+         y軸 : 度数（件数）
+         タイトル : 「ヒストグラム: 列名」
+
+     - データ:
+         NaN を除外した数値のみを対象とし、
+         指定したビン数（デフォルト 50）でヒストグラム化している。
+
+  2. 数値列の基本統計量 CSV
+
+     - ファイル名:
+         numeric_summary_stats.csv
+
+     - 1 行 = 1 数値列。主な列の意味:
+
+         - column : 列名
+         - count  : 有効な数値の件数（NaN 除外後）
+         - mean   : 平均値
+         - std    : 標準偏差
+         - min    : 最小値
+         - q05    : 5 パーセンタイル（下位 5%）
+         - q25    : 25 パーセンタイル（第1四分位）
+         - q50    : 50 パーセンタイル（中央値）
+         - q75    : 75 パーセンタイル（第3四分位）
+         - q95    : 95 パーセンタイル（上位 5%）
+         - max    : 最大値
+
+       → 各特徴量のレンジ・代表値・分布の偏りをざっくり把握するための表。
+
+  3. 文字列 / カテゴリ列の頻度表 CSV
+
+     - ファイル名:
+         <列名>_value_counts.csv
+       例: 地形分類_value_counts.csv
+
+     - 中身:
+         列名: 元の列名（カテゴリ値）
+         count: そのカテゴリ値の出現回数
+
+       ※ NaN（欠損）の頻度も含めて集計している。
+
+  4. 文字列 / カテゴリ列の棒グラフ PNG
+
+     - ファイル名:
+         <列名>_bar.png
+       例: 地形分類_bar.png
+
+     - 中身:
+         x軸 : 上位 N カテゴリ（デフォルト 20 件）をラベル表示
+         y軸 : 件数
+         タイトル : 「カテゴリ頻度（上位 N）: 列名」
+
+       → カテゴリ分布の偏り（特定クラスに極端に集中していないか）を
+         見るための概観用グラフ。
+
+
+【モード2（WMW + AUC）の出力ファイル仕様】
+
+  1. wmw_results_long.csv  （「縦長」形式：1行 = 特徴量 × クラスペア）
+
+     各行は「ある特徴量が、あるクラスペア（group1 vs group2）に対して
+     どれくらいクラス分離に効いているか」を表す。
+
+     主な列の意味:
+
+       - label_col
+           WMW 解析に用いたラベル列名。
+           例: "地形分類コード"
+
+       - feature
+           対象とした数値特徴量の列名。
+           例: "TEST1mDEM1k_epsg6673_slope_deg_r25m_gauss_b1"
+
+       - group1, group2
+           比較対象となる 2 クラスのラベル値。
+           例: group1=1010101, group2=3010101
+           （内部的には、同じペアが重複しないように小さい方を group1 として並べる）
+
+       - n_group1, n_group2
+           各グループで、有効な数値（NaN 除外）として WMW に使われたサンプル数。
+
+       - mean_group1, mean_group2
+           各グループの平均値。
+
+       - median_group1, median_group2
+           各グループの中央値。
+
+       - u_stat
+           Mann-Whitney U 検定の U 統計量。
+
+       - p_value
+           U 統計量に対応する p 値。
+           alternative（two-sided / greater / less）は対話的に選択する。
+
+       - auc
+           効果量としての AUC（0.5 = ランダム, 1.0 = 完全分離）。
+           ここでは「group1 の値が group2 より大きい確率 + 0.5 * 同値の確率」に対応。
+
+       - cliffs_delta
+           Cliff's delta（オプション）。2 * AUC - 1 に相当する値。
+           （calc_cliffs_delta=OFF の場合は NaN）
+
+       - note
+           サンプル数不足などでスキップされた場合の理由。
+
+  2. auc_matrix_by_feature.csv  （「行: 特徴量 × 列: クラスペア」の AUC 行列）
+
+     このファイルは AUC だけを抜き出して「マトリクス状」に並べたもの。
+
+       - 行 index: feature
+           特徴量名。
+
+       - 列: class_pair
+           "group1_vs_group2" という文字列で表現されたクラスペア。
+           例: "1010101_vs_3010101"
+
+       - セルの値: AUC
+           wmw_results_long.csv の auc を、feature × class_pair で pivot したもの。
+           Excel 等で開き、条件付き書式（例: AUC>=0.7 を色付け）をかけることで、
+           どの特徴量がどのクラス境界に対して効いているかを一覧できる。
+
+【結果の読み方の目安（経験則）】
+
+  ● モード1（単変量分布）
+
+    - numeric_summary_stats.csv
+        - q05, q95 付近が「人間が想定しているレンジ」と大きく違う場合、
+          外れ値・単位ミス・スケーリングミスの可能性を疑う。
+        - q50（中央値）と mean（平均）が大きくずれている場合、
+          片側に長い「裾」がある（右長 / 左長）と考えられる。
+          → ログ変換 / クリッピング候補。
+        - std が極端に大きいのに、AUC や feature importance が低い場合は、
+          「ノイズが多いだけの特徴量」の可能性がある。
+
+    - カテゴリ列の頻度（*_value_counts.csv + *_bar.png）
+        - 1〜2カテゴリにほとんどのサンプルが集中している場合、
+          そのカテゴリ列はモデルに入れてもほとんど効かない（ほぼ定数）可能性がある。
+        - 逆にカテゴリ種類が多すぎる（高カーディナリティ）場合、
+          one-hot などにすると次元爆発するため、事前にまとめる / ビン分けを検討する。
+
+
+  ● モード2（WMW + AUC）
+
+    - AUC（wmw_results_long.csv / auc_matrix_by_feature.csv）
+        - AUC ≒ 0.5
+            → 「ランダムと同等」。その特徴量単独では、そのクラスペアをほとんど分けられない。
+        - AUC ≳ 0.6
+            → 弱い分離。単独では心許ないが、他特徴量と組み合わせると効く可能性。
+        - AUC ≳ 0.7
+            → 中程度〜強い分離。該当クラスペアに対して「それなりに効く」特徴量。
+        - AUC ≳ 0.8
+            → かなり強い分離。ラベル付けが信頼できるなら、その境界に対して核となる特徴量候補。
+        ※ あくまで経験的な目安であり、データサイズ・ラベル品質によって解釈は変えること。
+
+    - p_value
+        - p_value < 0.05 なら「統計的には有意」とされることが多いが、
+          サンプル数が非常に多い場合は、わずかな差でも有意になりやすい。
+        - 実務的には「p値の有意性」よりも、「AUC や Cliff's δ が十分大きいか」を重視する。
+
+    - Cliff's delta（cliffs_delta）
+        - おおよその目安（文献でよく使われる基準の一例）:
+            |δ| < 0.147   → 効果ほぼなし
+            0.147〜0.33   → 小さい効果
+            0.33〜0.474   → 中くらいの効果
+            0.474〜1.0    → 大きい効果
+        - sign(δ)
+            δ > 0  → group1 > group2 の方向に大きい（group1 の方が値が大きい傾向）
+            δ < 0  → group1 < group2 の方向に大きい
+
+    - 実務上の使い方のイメージ
+        - まず auc_matrix_by_feature.csv を Excel で開き、
+          条件付き書式（例: AUC >= 0.7 を濃い色、0.6〜0.7 を薄い色）をかける。
+        - すると「どの特徴量が / どのクラスペアに対して効いているか」が一目で分かる。
+        - その上で、地形学的な解釈・常識（例: 開度は尾根 vs 谷で効いていて欲しい）
+          と整合しているかを確認し、RF の feature importance の結果とも照らし合わせる。
+
+
+想定用途:
+  - ランダムフォレストに与える前の特徴量の分布をざっくり確認
+  - ラベル列と特徴量の関係（どの特徴量がどのクラス境界に対して効いていそうか）を
+    WMW + AUC で定量的に把握する
 """
 
+from __future__ import annotations
+
 import sys
-import re
-from pathlib import Path
+import textwrap
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Tuple
+from pathlib import Path
+from typing import Iterable, List, Tuple, Dict, Any, Optional
 
+import numpy as np
 import pandas as pd
-from pandas.api.types import is_numeric_dtype
-
-# GUI なし環境でも動作するよう、非インタラクティブ backend を指定
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-from matplotlib import font_manager, rcParams
+import matplotlib.pyplot as plt
 
 try:
-    import geopandas as gpd  # GPKG 読み込み用（インストールされていれば使用）
+    import geopandas as gpd  # type: ignore
+    HAS_GPD = True
 except ImportError:
-    gpd = None
+    HAS_GPD = False
 
-# 日本語フォントが無い場合に英語ラベルに切り替えるかどうかのフラグ
-USE_ENGLISH_LABELS: bool = False
-
-
-# ============================================================
-# 日本語フォント設定まわり
-# ============================================================
-
-def setup_font_and_language() -> None:
-    """
-    日本語フォントの有無を確認し、フォント設定およびラベル言語モードを決める。
-
-    - 候補フォントが見つかればそれを使用（日本語ラベルのまま）。
-    - 見つからない場合は、ユーザーに
-        1) そのまま続行（日本語文字化けの可能性あり）
-        2) 英語ラベルに切り替える
-        3) 処理を中断
-      を選んでもらう。
-    """
-    global USE_ENGLISH_LABELS
-
-    candidates = [
-        "IPAexGothic",
-        "IPAGothic",
-        "Yu Gothic",
-        "YuGothic",
-        "Meiryo",
-        "MS Gothic",
-        "Hiragino Sans",
-        "Noto Sans CJK JP",
-    ]
-
-    available_fonts = {f.name for f in font_manager.fontManager.ttflist}
-    for name in candidates:
-        if name in available_fonts:
-            rcParams["font.family"] = name
-            print(f"[INFO] 日本語フォントを使用します: {name}")
-            USE_ENGLISH_LABELS = False
-            return
-
-    # ここまで来たら日本語フォント候補が見つからない
-    print("\n[WARN] 日本語フォント候補が見つかりません。")
-    print("      グラフ内の日本語（タイトル・軸ラベルなど）が文字化けする可能性があります。")
-    while True:
-        choice = input(
-            "対応を選択してください:\n"
-            "  1) そのまま続行（日本語ラベルのまま。文字化けの可能性あり）\n"
-            "  2) 英語ラベルに切り替える（title/count など）\n"
-            "  3) 処理を中断してフォントをインストールする\n"
-            "選択 [1/2/3]（Enter=1）: "
-        ).strip()
-        if choice == "" or choice == "1":
-            USE_ENGLISH_LABELS = False
-            print("[INFO] 既定フォントのまま続行します（日本語が文字化けする可能性があります）。\n")
-            return
-        elif choice == "2":
-            USE_ENGLISH_LABELS = True
-            print("[INFO] タイトル・ラベルを英語表記に切り替えます。\n")
-            return
-        elif choice == "3":
-            print("[INFO] ユーザー指定により処理を中断します。フォントインストール後に再実行してください。")
-            sys.exit(0)
-        else:
-            print("[WARN] 1/2/3 のいずれかを入力してください。")
+try:
+    from scipy.stats import mannwhitneyu  # type: ignore
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
 
 
 # ============================================================
-# ユーティリティ
+# 共通ユーティリティ
 # ============================================================
 
-def sanitize_filename(name: str) -> str:
-    """
-    列名などをファイル名に安全に使えるように変換する。
-    - 英数字・日本語・アンダースコア・ハイフン以外はアンダースコアに置換。
-    """
-    return re.sub(r'[^0-9A-Za-z\u3040-\u30ff\u4e00-\u9faf\-_]+', "_", str(name))
+
+def human_readable_bytes(num_bytes: float) -> str:
+    """バイト数を読みやすい文字列に変換する。"""
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if num_bytes < 1024.0:
+            return f"{num_bytes:,.1f} {unit}"
+        num_bytes /= 1024.0
+    return f"{num_bytes:.1f} PB"
 
 
-def ask_path() -> Path:
+def ask_file_path() -> Path:
     """入力ファイルパスを対話的に取得する。"""
-    print("=== 特徴量分布チェックツール ===")
     print("gpkg / parquet / csv のいずれか 1 ファイルを指定してください。")
     while True:
-        path_str = input("入力ファイルのパス: ").strip().strip('"').strip("'")
-        if not path_str:
-            print("[WARN] 空です。パスを入力してください。")
+        s = input("入力ファイルのパス: ").strip().strip('"').strip("'")
+        if not s:
+            print("[WARN] 空の入力です。パスを入力してください。")
             continue
-        p = Path(path_str)
+        p = Path(s)
         if not p.exists():
             print(f"[ERROR] ファイルが見つかりません: {p}")
             continue
         if not p.is_file():
-            print(f"[ERROR] ファイルではありません: {p}")
+            print(f"[ERROR] 通常のファイルではありません: {p}")
             continue
         return p
 
 
-def load_table(path: Path) -> pd.DataFrame:
-    """拡張子に応じてテーブルを読み込む。"""
-    ext = path.suffix.lower()
-    print(f"[INFO] 読み込み中: {path}")
-    try:
-        if ext in (".parquet", ".pq"):
-            print("[INFO] parquet として読み込みます。")
-            df = pd.read_parquet(path)
-        elif ext in (".csv", ".txt"):
-            print("[INFO] CSV として読み込みます。")
-            df = pd.read_csv(path)
-        elif ext == ".gpkg":
-            if gpd is None:
-                print("[ERROR] geopandas がインポートできません。gpkg を扱うには geopandas が必要です。")
-                sys.exit(1)
-            print("[INFO] GPKG (ベクタ) として読み込みます。geometry 列は削除します。")
-            gdf = gpd.read_file(path)
-            if "geometry" in gdf.columns:
-                df = gdf.drop(columns="geometry")
-            else:
-                df = pd.DataFrame(gdf)
-        else:
-            print(f"[ERROR] 未対応の拡張子です: {ext}")
-            sys.exit(1)
-    except Exception as e:
-        print(f"[ERROR] 読み込みに失敗しました: {e}")
-        sys.exit(1)
-
-    print(f"[INFO] 読み込み完了: {df.shape[0]} 行 × {df.shape[1]} 列")
-    mem_mb = df.memory_usage(deep=True).sum() / (1024 ** 2)
-    print(f"[INFO] 推定メモリ使用量: 約 {mem_mb:.1f} MB")
-    return df
-
-
-def show_columns(df: pd.DataFrame) -> None:
-    """列一覧を番号付きで表示する。"""
-    print("\n=== 列一覧 ===")
-    for i, (col, dtype) in enumerate(zip(df.columns, df.dtypes)):
-        print(f"[{i:3d}] {col}  (dtype: {dtype})")
-    print("====================")
-
-
-def ask_columns(df: pd.DataFrame) -> list[str]:
-    """解析対象とする列を対話的に選択する（番号指定 + 範囲指定対応）。
-
-    対応フォーマット例:
-      - 0,2,5
-      - 2-6          → 2,3,4,5,6
-      - 1-3,7,10-12  → 1,2,3,7,10,11,12
-      - all / 空Enter → 全列
+def prepare_output_dir(input_path: Path, suffix: str) -> Path:
     """
-    show_columns(df)
-    n_cols = len(df.columns)
-
-    while True:
-        s = input(
-            "解析対象とする列番号をカンマ区切りで入力してください\n"
-            "  例: 0,2,5 / 2-6 / 1-3,7,10-12\n"
-            "  all または空 Enter: 全列を対象にする\n"
-            "入力: "
-        ).strip()
-
-        if s == "" or s.lower() == "all":
-            selected_cols = list(df.columns)
-            print(f"[INFO] 全 {len(selected_cols)} 列を暫定選択しました。")
-            return selected_cols
-
-        parts = [x.strip() for x in s.split(",") if x.strip()]
-        indices: list[int] = []
-        ok = True
-
-        for p in parts:
-            # 範囲指定 (例: 2-6, 1:4)
-            if "-" in p or ":" in p:
-                delim = "-" if "-" in p else ":"
-                start_str, end_str = [q.strip() for q in p.split(delim, 1)]
-                if not (start_str.isdigit() and end_str.isdigit()):
-                    print(f"[WARN] 範囲指定が正しくありません: {p}")
-                    ok = False
-                    break
-                start = int(start_str)
-                end = int(end_str)
-                if start > end:
-                    print(f"[WARN] 範囲指定の開始 > 終了 です: {p}")
-                    ok = False
-                    break
-                if start < 0 or end >= n_cols:
-                    print(f"[WARN] 範囲外の番号を含んでいます: {p}  (有効範囲: 0 ～ {n_cols-1})")
-                    ok = False
-                    break
-                indices.extend(range(start, end + 1))
-            else:
-                # 単一番号
-                if not p.isdigit():
-                    print(f"[WARN] 数字または範囲ではない入力を検出しました: {p}")
-                    ok = False
-                    break
-                idx = int(p)
-                if idx < 0 or idx >= n_cols:
-                    print(f"[WARN] 範囲外の番号です: {idx}  (有効範囲: 0 ～ {n_cols-1})")
-                    ok = False
-                    break
-                indices.append(idx)
-
-        if not ok:
-            print("[INFO] もう一度入力してください。")
-            continue
-
-        if not indices:
-            print("[WARN] 列が一つも選択されていません。再入力してください。")
-            continue
-
-        # 重複を削除しつつ順序を維持
-        unique_indices: list[int] = []
-        seen = set()
-        for idx in indices:
-            if idx not in seen:
-                seen.add(idx)
-                unique_indices.append(idx)
-
-        selected_cols = [df.columns[i] for i in unique_indices]
-        print("[INFO] 選択された列:")
-        for c in selected_cols:
-            print(f"  - {c}")
-        return selected_cols
-
-
-def ask_float_with_default(prompt: str, default: float, min_value: float, max_value: float) -> float:
-    """下限・上限付き float 入力（空なら default）。"""
-    while True:
-        s = input(f"{prompt} [default={default}]: ").strip()
-        if s == "":
-            return default
-        try:
-            v = float(s)
-            if v < min_value or v > max_value:
-                print(f"[WARN] {min_value} ～ {max_value} の範囲で入力してください。")
-                continue
-            return v
-        except ValueError:
-            print("[WARN] 数値を入力してください。")
-
-
-def ask_int_with_default(prompt: str, default: int, min_value: int, allow_zero: bool = False) -> int:
-    """下限付き int 入力（空なら default）。"""
-    while True:
-        s = input(f"{prompt} [default={default}]: ").strip()
-        if s == "":
-            return default
-        try:
-            v = int(s)
-            if allow_zero and v == 0:
-                return v
-            if v < min_value:
-                print(f"[WARN] {min_value} 以上の整数を入力してください。")
-                continue
-            return v
-        except ValueError:
-            print("[WARN] 整数を入力してください。")
-
-
-def ask_thresholds() -> Tuple[float, int]:
-    """
-    列の自動分類に使う閾値を対話的に取得する。
-
-    戻り値:
-        numeric_ratio_threshold: 文字列列を数値キャストしてよいとみなす比率（0～1）
-        max_categories: カテゴリ列とみなす最大ユニーク数
-    """
-    print("\n=== 列の自動分類に使う閾値を設定します ===")
-    print(
-        "- 文字列列を数値に変換したとき、何 % 以上が変換成功なら「数値扱い」にするか\n"
-        "  （例: 0.95 → 全体の 95% 以上が数値に変換できれば numeric_cast）"
-    )
-    numeric_ratio_threshold = ask_float_with_default(
-        "数値変換成功率の閾値 (0.0～1.0)", default=0.95, min_value=0.0, max_value=1.0
-    )
-
-    print(
-        "\n- 文字列列のユニーク値が何種類以下なら「カテゴリ列」とみなすか\n"
-        "  （例: 30 以下ならカテゴリ列、それ以上なら ID ライクとしてスキップ）"
-    )
-    max_categories = ask_int_with_default(
-        "カテゴリ列とみなす最大ユニーク数", default=30, min_value=1, allow_zero=False
-    )
-
-    print(f"\n[INFO] 閾値設定: numeric_ratio_threshold={numeric_ratio_threshold}, max_categories={max_categories}")
-    return numeric_ratio_threshold, max_categories
-
-
-def ask_bins() -> int:
-    """ヒストグラムの階級数を尋ねる。"""
-    print("\n=== ヒストグラムの設定 ===")
-    return ask_int_with_default("ヒストグラムの階級数（bins）", default=30, min_value=1, allow_zero=False)
-
-
-def ask_sample_size() -> int:
-    """ヒストグラム計算用のサンプリング行数を尋ねる。0 で全件。"""
-    print(
-        "\n=== サンプリング設定（ヒストグラム用） ===\n"
-        "- 0: サンプリングせず、全行を使用（大きなファイルでは時間がかかることがあります）。\n"
-        "- 正の整数: 指定行数までランダムサンプリングしてヒストグラムを作成します。\n"
-        "  ※ 統計量（平均・分位点など）は常に全行を用いて計算します。\n"
-    )
-    return ask_int_with_default("ヒストグラム用サンプル行数 (0 = 全件)", default=0, min_value=0, allow_zero=True)
-
-
-def prepare_output_dir(input_path: Path) -> Path:
-    """
-    デフォルトの出力フォルダ（入力ファイルと同じフォルダにタイムスタンプ付き）を作成しつつ、
+    デフォルトの出力フォルダを作成しつつ、
     ユーザーに任意の保存先を指定する機会を与える。
     """
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    default_dir = input_path.parent / f"{input_path.stem}_hist_{ts}"
+    default_dir = input_path.parent / f"{input_path.stem}_{suffix}_{ts}"
 
     print("\n=== 出力フォルダの設定 ===")
     print(f"[INFO] デフォルトの出力フォルダ候補: {default_dir}")
@@ -366,7 +280,7 @@ def prepare_output_dir(input_path: Path) -> Path:
             "出力フォルダを変更する場合はパスを入力してください。\n"
             "  - 空 Enter: 上記のデフォルトフォルダを使用\n"
             "  - 任意のパス: そのフォルダを作成して使用\n"
-            "入力: "
+            "出力パス: "
         ).strip().strip('"').strip("'")
 
         if s == "":
@@ -380,281 +294,653 @@ def prepare_output_dir(input_path: Path) -> Path:
             return out_dir
         except Exception as e:
             print(f"[ERROR] 出力フォルダを作成できません: {e}")
-            print("別のパスを指定してください。")
 
 
-# ============================================================
-# 列タイプ判定 & 統計・プロット
-# ============================================================
+def detect_file_type(path: Path) -> str:
+    """拡張子からファイル種別を判定するだけの簡易関数。"""
+    ext = path.suffix.lower()
+    if ext in [".gpkg", ".shp", ".geojson"]:
+        return "vector"
+    if ext in [".parquet"]:
+        return "parquet"
+    if ext in [".csv", ".txt"]:
+        return "csv"
+    return "unknown"
 
-def classify_column_for_plot(
-    s: pd.Series,
-    numeric_ratio_threshold: float,
-    max_categories: int,
-) -> Tuple[str, Optional[float], Optional[int]]:
-    """
-    列をヒストグラム/棒グラフの観点から分類する。
 
-    戻り値:
-        col_type: "numeric" / "numeric_cast" / "category" / "id_like"
-        numeric_ratio: 文字列→数値変換成功率（numeric_cast 判定に利用した値。数値列では None）
-        nunique: ユニーク数（category / id_like 判定に利用した値。数値列では None）
-    """
-    # もともと数値型なら即 numeric
-    if is_numeric_dtype(s):
-        return "numeric", None, None
+def load_table(path: Path) -> pd.DataFrame:
+    """gpkg / parquet / csv を DataFrame として読み込む。"""
+    ftype = detect_file_type(path)
+    print(f"[INFO] 読み込み中: {path}")
 
-    # 文字列として扱う
-    s_str = s.astype(str).str.strip()
-    # 数値化トライ
-    s_num = pd.to_numeric(s_str, errors="coerce")
-    numeric_ratio = float(s_num.notna().mean())
-
-    if numeric_ratio >= numeric_ratio_threshold:
-        # ほぼ数値とみなす
-        return "numeric_cast", numeric_ratio, None
-
-    # 数値化が難しい → カテゴリ or ID とみなす
-    nunique = int(s_str.nunique(dropna=True))
-    if nunique <= max_categories:
-        return "category", numeric_ratio, nunique
+    if ftype == "vector":
+        if not HAS_GPD:
+            print("[ERROR] geopandas がインポートできません。`mamba install geopandas` 等でインストールしてください。")
+            sys.exit(1)
+        gdf = gpd.read_file(path)
+        if "geometry" in gdf.columns:
+            print("[INFO] GPKG (ベクタ) として読み込みます。geometry 列は削除します。")
+            df = pd.DataFrame(gdf.drop(columns=["geometry"]))
+        else:
+            df = pd.DataFrame(gdf)
+    elif ftype == "parquet":
+        df = pd.read_parquet(path)
+    elif ftype == "csv":
+        df = pd.read_csv(path)
     else:
-        return "id_like", numeric_ratio, nunique
+        print("[ERROR] 未対応の拡張子です。gpkg / parquet / csv を指定してください。")
+        sys.exit(1)
+
+    print(f"[INFO] 読み込み完了: {len(df):,} 行 × {len(df.columns)} 列")
+    try:
+        mem = df.memory_usage(deep=True).sum()
+        print(f"[INFO] 推定メモリ使用量: 約 {human_readable_bytes(mem)}")
+    except Exception:
+        pass
+    return df
 
 
-def compute_stats(series: pd.Series, col_name: str) -> dict:
-    """1 列分の基本統計量を計算して dict で返す。（数値列用）"""
+def list_columns(df: pd.DataFrame) -> None:
+    """列一覧を表示する。"""
+    print("\n=== 列一覧 ===")
+    for i, c in enumerate(df.columns):
+        dtype = df[c].dtype
+        print(f"[{i:3d}] {c}  (dtype: {dtype})")
+    print("====================")
+
+
+def parse_column_selection(s: str, max_index: int) -> List[int]:
+    """
+    列番号入力文字列をパースする。
+    例:
+      "0,2,5" / "2-6" / "1-3,7"
+    """
+    s = s.strip()
+    if not s or s.lower() == "all":
+        return list(range(max_index + 1))
+
+    indices: List[int] = []
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    for part in parts:
+        if "-" in part:
+            a, b = part.split("-", 1)
+            try:
+                start = int(a)
+                end = int(b)
+            except ValueError:
+                print(f"[WARN] 無効な範囲指定をスキップします: {part}")
+                continue
+            if start > end:
+                start, end = end, start
+            for idx in range(start, end + 1):
+                if 0 <= idx <= max_index:
+                    indices.append(idx)
+        else:
+            try:
+                idx = int(part)
+            except ValueError:
+                print(f"[WARN] 無効な番号をスキップします: {part}")
+                continue
+            if 0 <= idx <= max_index:
+                indices.append(idx)
+    # 重複削除
+    indices = sorted(set(indices))
+    return indices
+
+
+def is_numeric_series(s: pd.Series) -> bool:
+    return pd.api.types.is_numeric_dtype(s.dtype)
+
+
+def is_string_series(s: pd.Series) -> bool:
+    return pd.api.types.is_string_dtype(s.dtype) or pd.api.types.is_categorical_dtype(s.dtype)
+
+
+# ============================================================
+# モード1: 単変量分布の確認（既存ロジック）
+# ============================================================
+
+
+def ask_bins() -> int:
+    """数値用ヒストグラムのビン数を尋ねる。"""
+    while True:
+        s = input("ヒストグラムの階級数（ビン数）を指定してください [default=50]: ").strip()
+        if not s:
+            return 50
+        try:
+            v = int(s)
+            if v <= 0:
+                raise ValueError
+            return v
+        except ValueError:
+            print("[WARN] 正の整数を入力してください。")
+
+
+def ask_top_k() -> int:
+    """カテゴリ頻度の上位何件を棒グラフにするか。"""
+    while True:
+        s = input("カテゴリ頻度の上位何件を棒グラフにしますか？ [default=20]: ").strip()
+        if not s:
+            return 20
+        try:
+            v = int(s)
+            if v <= 0:
+                raise ValueError
+            return v
+        except ValueError:
+            print("[WARN] 正の整数を入力してください。")
+
+
+def plot_numeric_hist(series: pd.Series, colname: str, out_dir: Path, bins: int) -> Dict[str, Any]:
+    """数値列のヒストグラムを作成し、PNG 保存＋統計量を返す。"""
     s = pd.to_numeric(series, errors="coerce").dropna()
+    stats: Dict[str, Any] = {}
+    stats["count"] = int(s.shape[0])
     if s.empty:
-        return {
-            "column": col_name,
-            "count": 0,
-            "mean": float("nan"),
-            "std": float("nan"),
-            "min": float("nan"),
-            "q05": float("nan"),
-            "q25": float("nan"),
-            "median": float("nan"),
-            "q75": float("nan"),
-            "q95": float("nan"),
-            "max": float("nan"),
-        }
+        print(f"[WARN] 列 '{colname}': 有効な数値データがありません。")
+        return stats
 
-    return {
-        "column": col_name,
-        "count": int(s.count()),
-        "mean": float(s.mean()),
-        "std": float(s.std()),
-        "min": float(s.min()),
-        "q05": float(s.quantile(0.05)),
-        "q25": float(s.quantile(0.25)),
-        "median": float(s.median()),
-        "q75": float(s.quantile(0.75)),
-        "q95": float(s.quantile(0.95)),
-        "max": float(s.max()),
-    }
+    stats["mean"] = float(s.mean())
+    stats["std"] = float(s.std())
+    stats["min"] = float(s.min())
+    stats["max"] = float(s.max())
+    stats["q05"] = float(s.quantile(0.05))
+    stats["q25"] = float(s.quantile(0.25))
+    stats["q50"] = float(s.quantile(0.50))
+    stats["q75"] = float(s.quantile(0.75))
+    stats["q95"] = float(s.quantile(0.95))
+
+    plt.figure(figsize=(8, 5))
+    plt.hist(s.values, bins=bins, edgecolor="black")
+    plt.title(f"ヒストグラム: {colname}")
+    plt.xlabel(colname)
+    plt.ylabel("頻度")
+    plt.tight_layout()
+    out_path = out_dir / f"{colname}_hist.png"
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"[OK] 数値列 '{colname}' のヒストグラムを保存: {out_path}")
+    return stats
 
 
-def save_histogram(
-    series: pd.Series,
-    col_name: str,
-    out_dir: Path,
-    bins: int,
-    sample_n: Optional[int],
-) -> None:
-    """1 列分のヒストグラムを PNG として保存する。（数値列用）"""
-    global USE_ENGLISH_LABELS
+def plot_categorical_bar(series: pd.Series, colname: str, out_dir: Path, top_k: int) -> pd.DataFrame:
+    """文字列 / カテゴリ列の value_counts を棒グラフ＋CSV に出力する。"""
+    s = series.astype("string")
+    vc = s.value_counts(dropna=False)
+    vc_df = vc.reset_index()
+    vc_df.columns = [colname, "count"]
 
-    s = pd.to_numeric(series, errors="coerce").dropna()
-    if s.empty:
-        print(f"[WARN] 列 '{col_name}' は有効な数値データがありません。ヒストグラムをスキップします。")
+    # CSV 出力
+    csv_path = out_dir / f"{colname}_value_counts.csv"
+    vc_df.to_csv(csv_path, index=False)
+    print(f"[OK] 列 '{colname}' の頻度表 CSV を保存: {csv_path}")
+
+    top = vc.head(top_k)
+    plt.figure(figsize=(10, 5))
+    plt.bar(range(len(top)), top.values)
+    plt.xticks(range(len(top)), [str(x) for x in top.index], rotation=45, ha="right")
+    plt.title(f"カテゴリ頻度（上位 {top_k}）: {colname}")
+    plt.ylabel("件数")
+    plt.tight_layout()
+    out_path = out_dir / f"{colname}_bar.png"
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"[OK] 列 '{colname}' の棒グラフを保存: {out_path}")
+    return vc_df
+
+
+def run_hist_mode(df: pd.DataFrame, input_path: Path) -> None:
+    """モード1: 単変量分布の確認。"""
+    list_columns(df)
+    print(
+        textwrap.dedent(
+            """
+            解析対象とする列番号をカンマ区切りで入力してください
+              例: 0,2,5 / 2-6 / 1-3,7
+              all または空 Enter: 全列を対象にする
+            """
+        ).strip()
+    )
+    sel = input("入力: ")
+    indices = parse_column_selection(sel, len(df.columns) - 1)
+
+    bins = ask_bins()
+    top_k = ask_top_k()
+
+    out_dir = prepare_output_dir(input_path, suffix="hist")
+
+    stats_rows: List[Dict[str, Any]] = []
+
+    for idx in indices:
+        col = df.columns[idx]
+        s = df[col]
+        if is_numeric_series(s):
+            print(f"\n[NUMERIC] 列 '{col}' を解析します。")
+            stats = plot_numeric_hist(s, col, out_dir, bins=bins)
+            stats["column"] = col
+            stats_rows.append(stats)
+        elif is_string_series(s):
+            print(f"\n[STRING] 列 '{col}' を解析します。")
+            plot_categorical_bar(s, col, out_dir, top_k=top_k)
+        else:
+            print(f"\n[SKIP] 列 '{col}' (dtype: {s.dtype}) は数値でも文字列でもないためスキップします。")
+
+    if stats_rows:
+        stats_df = pd.DataFrame(stats_rows)
+        stats_df = stats_df[["column", "count", "mean", "std", "min", "q05", "q25", "q50", "q75", "q95", "max"]]
+        csv_path = out_dir / "numeric_summary_stats.csv"
+        stats_df.to_csv(csv_path, index=False)
+        print(f"\n[OK] 数値列の基本統計量 CSV を保存しました: {csv_path}")
+
+    print("\n=== モード1: 単変量分布の確認 完了 ===")
+
+
+# ============================================================
+# モード2: ペアワイズ WMW + AUC 解析
+# ============================================================
+
+
+def ask_label_column(df: pd.DataFrame) -> str:
+    """ラベル列（クラス列）を 1 つ選択させる。"""
+    list_columns(df)
+    while True:
+        s = input(
+            "WMW解析に使う「ラベル列」（クラスを表す列）の番号を 1 つ入力してください（例: 5）: "
+        ).strip()
+        try:
+            idx = int(s)
+        except ValueError:
+            print("[WARN] 整数で列番号を指定してください。")
+            continue
+        if not (0 <= idx < len(df.columns)):
+            print("[WARN] 範囲外の列番号です。")
+            continue
+        col = df.columns[idx]
+        print(f"[INFO] ラベル列: {col}")
+        return col
+
+
+def ask_class_pairs(labels: List[Any]) -> List[Tuple[Any, Any]]:
+    """クラスペアの選び方を対話的に決める。"""
+    uniq = list(sorted(labels))
+    print("\n=== クラス値の確認 ===")
+    print("ラベル列のユニーク値（最大20件まで表示）:")
+    for i, v in enumerate(uniq[:20]):
+        print(f"  {i}: {v}")
+    if len(uniq) > 20:
+        print(f"  ...（他 {len(uniq) - 20} 種類）")
+
+    from itertools import combinations
+
+    while True:
+        print(
+            textwrap.dedent(
+                """
+                クラスペアの選び方を選択してください:
+                  1) 全てのクラスペアを対象にする（C(n,2) 通り）
+                  2) 特定のクラスペアのみ指定する
+                """
+            ).strip()
+        )
+        mode = input("番号を入力してください [1-2]（Enter=1）: ").strip()
+        if not mode:
+            mode = "1"
+        if mode == "1":
+            pairs = list(combinations(uniq, 2))
+            print("[INFO] 対象クラスペア:")
+            for p in pairs:
+                print(f"  - {p}")
+            return pairs
+        elif mode == "2":
+            print(
+                "比較したいクラスペアをカンマ区切りで指定してください（例: 10-20,10-30）\n"
+                "ラベル値には上記のユニーク値をそのまま指定してください。"
+            )
+            s = input("入力: ").strip()
+            if not s:
+                print("[WARN] 空の入力です。やり直してください。")
+                continue
+            pairs: List[Tuple[Any, Any]] = []
+            for part in s.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                if "-" not in part:
+                    print(f"[WARN] '{part}' は 'A-B' 形式ではありません。スキップします。")
+                    continue
+                a_str, b_str = part.split("-", 1)
+                a_str, b_str = a_str.strip(), b_str.strip()
+                # 文字列として比較する（int でも str でも OK）
+                # 入力とラベルの型が違う場合があるので、文字列表現でマッチング
+                def match_label(token: str) -> Optional[Any]:
+                    # 完全一致を優先
+                    for v in uniq:
+                        if str(v) == token:
+                            return v
+                    return None
+
+                a_val = match_label(a_str)
+                b_val = match_label(b_str)
+                if a_val is None or b_val is None:
+                    print(f"[WARN] '{part}' に含まれるクラス値がユニーク値と一致しません。スキップします。")
+                    continue
+                if a_val == b_val:
+                    print(f"[WARN] 同じ値同士のペア '{part}' はスキップします。")
+                    continue
+                # 順序を固定（小さい方を group1 とする）
+                if str(a_val) <= str(b_val):
+                    pairs.append((a_val, b_val))
+                else:
+                    pairs.append((b_val, a_val))
+            pairs = sorted(set(pairs))
+            if not pairs:
+                print("[WARN] 有効なクラスペアがありません。再入力してください。")
+                continue
+            print("[INFO] 対象クラスペア:")
+            for p in pairs:
+                print(f"  - {p}")
+            return pairs
+        else:
+            print("[WARN] 1 または 2 を入力してください。")
+
+
+def ask_numeric_feature_columns(df: pd.DataFrame, label_col: str) -> List[str]:
+    """数値特徴量列を選択させる。"""
+    numeric_cols = [c for c in df.columns if is_numeric_series(df[c]) and c != label_col]
+    if not numeric_cols:
+        print("[ERROR] ラベル列以外に数値列がありません。")
+        sys.exit(1)
+
+    print("\n=== 数値特徴量列の候補 ===")
+    for i, c in enumerate(numeric_cols):
+        print(f"[{i:3d}] {c}")
+    print("====================")
+    print(
+        textwrap.dedent(
+            """
+            解析対象とする列番号をカンマ区切りで入力してください
+              例: 0,2,5 / 2-6 / 1-3,7
+              all または空 Enter: 上記の全列を対象にする
+            """
+        ).strip()
+    )
+    sel = input("入力: ")
+    indices = parse_column_selection(sel, len(numeric_cols) - 1)
+    selected = [numeric_cols[i] for i in indices]
+    print("[INFO] 対象特徴量列:")
+    for c in selected:
+        print(f"  - {c}")
+    return selected
+
+
+@dataclass
+class WMWSettings:
+    alternative: str
+    max_sample_per_group: int
+    min_n_per_group: int
+    calc_cliffs_delta: bool
+
+
+def ask_wmw_settings() -> WMWSettings:
+    """WMW 検定の設定を対話的に取得する。"""
+    # alternative
+    while True:
+        s = input(
+            "検定の方向を選んでください [two-sided/greater/less]（Enter=two-sided）: "
+        ).strip()
+        if not s:
+            s = "two-sided"
+        if s not in ("two-sided", "greater", "less"):
+            print("[WARN] two-sided / greater / less のいずれかを指定してください。")
+            continue
+        alternative = s
+        break
+
+    # max_sample_per_group
+    while True:
+        s = input(
+            "各グループからの最大サンプル数 (0 = 全件使用) [default=50000]: "
+        ).strip()
+        if not s:
+            max_sample = 50000
+            break
+        try:
+            v = int(s)
+            if v < 0:
+                raise ValueError
+            max_sample = v
+            break
+        except ValueError:
+            print("[WARN] 0 以上の整数を入力してください。")
+
+    # min_n_per_group
+    while True:
+        s = input(
+            "最小サンプル数 min_n_per_group [default=30]: "
+        ).strip()
+        if not s:
+            min_n = 30
+            break
+        try:
+            v = int(s)
+            if v <= 0:
+                raise ValueError
+            min_n = v
+            break
+        except ValueError:
+            print("[WARN] 正の整数を入力してください。")
+
+    # Cliff's delta
+    s = input("Cliff's delta を計算しますか？ [y/N]: ").strip().lower()
+    calc_delta = s == "y"
+
+    print(
+        f"[INFO] alternative={alternative}, "
+        f"max_sample_per_group={max_sample}, "
+        f"min_n_per_group={min_n}, "
+        f"Cliff's delta={'ON' if calc_delta else 'OFF'}"
+    )
+    return WMWSettings(
+        alternative=alternative,
+        max_sample_per_group=max_sample,
+        min_n_per_group=min_n,
+        calc_cliffs_delta=calc_delta,
+    )
+
+
+def run_wmw_pairwise_mode(df: pd.DataFrame, input_path: Path) -> None:
+    """モード2: ペアワイズ WMW + AUC 解析。"""
+    if not HAS_SCIPY:
+        print(
+            "[ERROR] scipy がインポートできません。\n"
+            "mamba あるいは pip で scipy をインストールしてから再実行してください。\n"
+            "  例) mamba install scipy\n"
+        )
+        sys.exit(1)
+
+    # ラベル列の選択
+    label_col = ask_label_column(df)
+    label_series = df[label_col]
+    labels = label_series.dropna().unique().tolist()
+    if len(labels) < 2:
+        print("[ERROR] ラベル列に 2 種類以上の値が必要です。")
+        sys.exit(1)
+
+    # クラスペア
+    pairs = ask_class_pairs(labels)
+
+    # 特徴量列（数値）選択
+    feature_cols = ask_numeric_feature_columns(df, label_col)
+
+    # WMW 設定
+    settings = ask_wmw_settings()
+
+    # 出力フォルダ
+    out_dir = prepare_output_dir(input_path, suffix="WMW")
+
+    # 結果格納
+    rows: List[Dict[str, Any]] = []
+
+    rng = np.random.default_rng()
+
+    print("\n[INFO] 特徴量 × クラスペアごとに WMW + AUC を計算します。")
+
+    for feat in feature_cols:
+        print(f"\n=== 特徴量 '{feat}' ===")
+        x = pd.to_numeric(df[feat], errors="coerce")
+        for g1, g2 in pairs:
+            mask1 = label_series == g1
+            mask2 = label_series == g2
+            s1 = x[mask1].dropna().to_numpy()
+            s2 = x[mask2].dropna().to_numpy()
+
+            n1, n2 = len(s1), len(s2)
+            row: Dict[str, Any] = {
+                "label_col": label_col,
+                "feature": feat,
+                "group1": g1,
+                "group2": g2,
+                "n_group1": n1,
+                "n_group2": n2,
+                "mean_group1": float(np.mean(s1)) if n1 > 0 else np.nan,
+                "mean_group2": float(np.mean(s2)) if n2 > 0 else np.nan,
+                "median_group1": float(np.median(s1)) if n1 > 0 else np.nan,
+                "median_group2": float(np.median(s2)) if n2 > 0 else np.nan,
+            }
+
+            if n1 < settings.min_n_per_group or n2 < settings.min_n_per_group:
+                msg = f"n too small (n1={n1}, n2={n2} < {settings.min_n_per_group})"
+                print(f"[WARN] ({g1} vs {g2}): {msg} → スキップ")
+                row.update(
+                    {
+                        "u_stat": np.nan,
+                        "p_value": np.nan,
+                        "auc": np.nan,
+                        "cliffs_delta": np.nan,
+                        "note": msg,
+                    }
+                )
+                rows.append(row)
+                continue
+
+            # サンプリング
+            if settings.max_sample_per_group > 0:
+                if n1 > settings.max_sample_per_group:
+                    s1 = rng.choice(s1, size=settings.max_sample_per_group, replace=False)
+                    n1 = len(s1)
+                if n2 > settings.max_sample_per_group:
+                    s2 = rng.choice(s2, size=settings.max_sample_per_group, replace=False)
+                    n2 = len(s2)
+
+            # WMW
+            try:
+                res = mannwhitneyu(s1, s2, alternative=settings.alternative)
+                u_stat = float(res.statistic)
+                p_value = float(res.pvalue)
+            except Exception as e:
+                msg = f"mannwhitneyu error: {e}"
+                print(f"[ERROR] ({g1} vs {g2}): {msg}")
+                row.update(
+                    {
+                        "u_stat": np.nan,
+                        "p_value": np.nan,
+                        "auc": np.nan,
+                        "cliffs_delta": np.nan,
+                        "note": msg,
+                    }
+                )
+                rows.append(row)
+                continue
+
+            # AUC (s1 が group1, s2 が group2)
+            # U / (n1*n2) が P(X1 > X2) + 0.5 P(=) に対応
+            auc = u_stat / (n1 * n2)
+
+            # Cliff's delta（近似）
+            if settings.calc_cliffs_delta:
+                delta = 2.0 * auc - 1.0
+            else:
+                delta = np.nan
+
+            row.update(
+                {
+                    "u_stat": u_stat,
+                    "p_value": p_value,
+                    "auc": auc,
+                    "cliffs_delta": delta,
+                    "note": "",
+                }
+            )
+            print(f"  ({g1} vs {g2}): n1={n1}, n2={n2}, U={u_stat:.3g}, p={p_value:.3g}, AUC={auc:.3f}")
+            rows.append(row)
+
+    if not rows:
+        print("[WARN] 有効な結果が 1 行もありませんでした。")
         return
 
-    if sample_n is not None and sample_n > 0 and len(s) > sample_n:
-        print(f"[INFO] 列 '{col_name}' は {len(s)} 件中 {sample_n} 件をサンプリングしてヒストグラムを作成します。")
-        s_plot = s.sample(sample_n, random_state=0)
-    else:
-        s_plot = s
+    result_df = pd.DataFrame(rows)
+    long_path = out_dir / "wmw_results_long.csv"
+    result_df.to_csv(long_path, index=False)
+    print(f"\n[OK] WMW 結果（ロング形式）CSV を保存しました: {long_path}")
 
-    safe_name = sanitize_filename(col_name)
-    png_path = out_dir / f"hist_{safe_name}.png"
+    # AUC 行列 (feature × classpair)
+    # 列名は "g1_vs_g2"
+    mat_df = result_df.copy()
+    mat_df["class_pair"] = mat_df.apply(
+        lambda r: f"{r['group1']}_vs_{r['group2']}", axis=1
+    )
+    auc_matrix = mat_df.pivot_table(
+        index="feature",
+        columns="class_pair",
+        values="auc",
+        aggfunc="mean",
+    )
+    auc_matrix_path = out_dir / "auc_matrix_by_feature.csv"
+    auc_matrix.to_csv(auc_matrix_path)
+    print(f"[OK] AUC 行列 CSV を保存しました: {auc_matrix_path}")
 
-    plt.figure(figsize=(8, 6))
-    plt.hist(s_plot, bins=bins)
-
-    if USE_ENGLISH_LABELS:
-        title = f"{col_name} histogram"
-        xlabel = col_name
-        ylabel = "count"
-    else:
-        title = f"{col_name} のヒストグラム"
-        xlabel = col_name
-        ylabel = "頻度"
-
-    plt.title(title)
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(png_path)
-    plt.close()
-
-    print(f"[OK] ヒストグラム保存: {png_path}")
-
-
-def save_category_bar_and_counts(
-    series: pd.Series,
-    col_name: str,
-    out_dir: Path,
-) -> None:
-    """
-    カテゴリ列について、棒グラフ PNG と value_counts CSV を保存する。
-    （既に max_categories 以下である前提）
-    """
-    global USE_ENGLISH_LABELS
-
-    s_str = series.astype(str)
-    vc = s_str.value_counts().sort_values(ascending=False)
-
-    safe_name = sanitize_filename(col_name)
-
-    # 棒グラフ
-    png_path = out_dir / f"bar_{safe_name}.png"
-    plt.figure(figsize=(8, 6))
-    vc.plot(kind="bar")
-
-    if USE_ENGLISH_LABELS:
-        title = f"{col_name} category counts"
-        xlabel = col_name
-        ylabel = "count"
-    else:
-        title = f"{col_name} のカテゴリ頻度"
-        xlabel = col_name
-        ylabel = "件数"
-
-    plt.title(title)
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.tight_layout()
-    plt.savefig(png_path)
-    plt.close()
-    print(f"[OK] 棒グラフ保存: {png_path}")
-
-    # value_counts CSV
-    csv_path = out_dir / f"value_counts_{safe_name}.csv"
-    vc.to_csv(csv_path, header=["count"], encoding="utf-8-sig")
-    print(f"[OK] value_counts CSV 保存: {csv_path}")
+    print("\n=== モード2: ペアワイズ WMW + AUC 解析 完了 ===")
 
 
 # ============================================================
-# メイン処理
+# メイン
 # ============================================================
+
 
 def main() -> None:
-    # 0) フォント・ラベル言語設定
-    setup_font_and_language()
+    print("=== 特徴量分布チェックツール ===\n")
 
-    # 1) 入力ファイル
-    input_path = ask_path()
-
-    # 2) テーブル読み込み
+    # 入力ファイル
+    input_path = ask_file_path()
     df = load_table(input_path)
 
-    # 3) 列選択（暫定）
-    selected_cols = ask_columns(df)
+    # モード選択
+    print(
+        textwrap.dedent(
+            """
+            モードを選んでください:
+              1) 単変量分布の確認（ヒストグラム + 統計量 / カテゴリ頻度）
+              2) ペアワイズ WMW + AUC 解析（2クラス間の特徴量の効き具合を定量評価）
+              0) 終了
+            """
+        ).strip()
+    )
+    while True:
+        mode = input("番号を入力してください [0-2]: ").strip()
+        if not mode:
+            mode = "1"
+        if mode not in ("0", "1", "2"):
+            print("[WARN] 0 / 1 / 2 のいずれかを入力してください。")
+            continue
+        break
 
-    # 4) 閾値設定（数値変換成功率・カテゴリ最大ユニーク数）
-    numeric_ratio_threshold, max_categories = ask_thresholds()
-
-    # 5) ヒストグラム設定
-    bins = ask_bins()
-    sample_n = ask_sample_size()
-
-    # 6) 出力フォルダ準備（ユーザーが保存先を選択可能）
-    out_dir = prepare_output_dir(input_path)
-
-    # 7) 列ごとの分類結果を保存するためのリスト
-    stats_list: list[dict] = []
-    col_info_list: list[dict] = []
-
-    print("\n[INFO] 列ごとの判定と処理を開始します。\n")
-
-    for col in selected_cols:
-        print(f"=== 列 '{col}' の判定 ===")
-        s = df[col]
-
-        col_type, numeric_ratio, nunique = classify_column_for_plot(
-            s, numeric_ratio_threshold=numeric_ratio_threshold, max_categories=max_categories
-        )
-
-        # 判定結果をログ用リストに追加
-        col_info = {
-            "column": col,
-            "dtype": str(s.dtype),
-            "col_type": col_type,
-            "numeric_ratio": numeric_ratio,
-            "nunique": nunique,
-        }
-        col_info_list.append(col_info)
-
-        if col_type == "numeric":
-            print(f"[INFO] 列 '{col}' は数値列 (dtype={s.dtype}) と判定されました。")
-            stats = compute_stats(s, col)
-            stats_list.append(stats)
-            save_histogram(s, col, out_dir, bins=bins, sample_n=sample_n)
-
-        elif col_type == "numeric_cast":
-            print(
-                f"[INFO] 列 '{col}' は文字列ですが、数値変換成功率 {numeric_ratio:.3f} により "
-                f"'numeric_cast' と判定されました。数値に変換して処理します。"
-            )
-            s_num = pd.to_numeric(s.astype(str).str.strip(), errors="coerce")
-            stats = compute_stats(s_num, col)
-            stats_list.append(stats)
-            save_histogram(s_num, col, out_dir, bins=bins, sample_n=sample_n)
-
-        elif col_type == "category":
-            print(
-                f"[INFO] 列 '{col}' はカテゴリ列と判定されました。"
-                f"(numeric_ratio={numeric_ratio:.3f}, nunique={nunique})"
-            )
-            save_category_bar_and_counts(s, col, out_dir)
-
-        elif col_type == "id_like":
-            print(
-                f"[INFO] 列 '{col}' は ID / 自由記述などの文字列列と推定されました。"
-                f"(numeric_ratio={numeric_ratio:.3f}, nunique={nunique})"
-            )
-            print("[INFO] デフォルト設定ではヒストグラム・棒グラフの作成をスキップします。")
-
-        else:
-            print(f"[WARN] 列 '{col}' の判定で想定外のタイプが返されました: {col_type}")
-            print("[INFO] この列の処理はスキップします。")
-
-        print("")
-
-    # 8) 統計量 CSV 出力（数値/数値キャスト列のみ）
-    if stats_list:
-        stats_df = pd.DataFrame(stats_list)
-        stats_csv_path = out_dir / "summary_stats.csv"
-        stats_df.to_csv(stats_csv_path, index=False, encoding="utf-8-sig")
-        print(f"[OK] 数値列の統計量 CSV を保存しました: {stats_csv_path}")
-    else:
-        print("[INFO] 数値列（numeric / numeric_cast）がなかったため、summary_stats.csv は出力しません。")
-
-    # 9) 列判定結果ログ CSV
-    col_info_df = pd.DataFrame(col_info_list)
-    col_info_csv_path = out_dir / "column_type_summary.csv"
-    col_info_df.to_csv(col_info_csv_path, index=False, encoding="utf-8-sig")
-    print(f"[OK] 列の判定結果ログ CSV を保存しました: {col_info_csv_path}")
-
-    print("\n=== 処理完了 ===")
-    print("・出力フォルダ内の PNG / CSV を確認してください。")
-    print("  - summary_stats.csv : 数値列の基本統計量")
-    print("  - hist_*.png        : 数値列のヒストグラム")
-    print("  - bar_*.png         : カテゴリ列の棒グラフ")
-    print("  - value_counts_*.csv: カテゴリ列の出現頻度")
-    print("  - column_type_summary.csv: 列ごとの判定結果の一覧")
+    if mode == "0":
+        print("終了します。")
+        return
+    elif mode == "1":
+        run_hist_mode(df, input_path)
+    elif mode == "2":
+        run_wmw_pairwise_mode(df, input_path)
 
 
 if __name__ == "__main__":
