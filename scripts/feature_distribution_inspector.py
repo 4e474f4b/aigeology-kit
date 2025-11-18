@@ -145,6 +145,23 @@
            Excel 等で開き、条件付き書式（例: AUC>=0.7 を色付け）をかけることで、
            どの特徴量がどのクラス境界に対して効いているかを一覧できる。
 
+  3. wmw_result_auc_ge.<thr>.csv / wmw_result_auc_lt_<thr>.csv
+
+     AUC の閾値 thr （デフォルト 0.70）を対話的に指定し、閾値以上の行と閾値未満の行を別々の csv に書き出す。
+
+       - wmw_results_auc_ge_<thr>.csv
+           → AUC >= thr の行だけを含む。
+
+       - wmw_results_auc_lt_<thr>.csv
+           → AUC < thr の行だけを含む。
+
+     いずれも wmw_results_long.csv のサブセットであり、ログに表示される SUMMARY は「それぞれ20行のダイジェスト」のみ。
+
+       - 列: class_pair
+           "group1_vs_group2" という文字列で表現されたクラスペア。
+           例: "1010101_vs_3010101"
+
+
 【結果の読み方の目安（経験則）】
 
   ● モード1（単変量分布）
@@ -472,7 +489,7 @@ def plot_categorical_bar(series: pd.Series, colname: str, out_dir: Path, top_k: 
 
     # CSV 出力
     csv_path = out_dir / f"{colname}_value_counts.csv"
-    vc_df.to_csv(csv_path, index=False)
+    vc_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
     print(f"[OK] 列 '{colname}' の頻度表 CSV を保存: {csv_path}")
 
     top = vc.head(top_k)
@@ -529,7 +546,7 @@ def run_hist_mode(df: pd.DataFrame, input_path: Path) -> None:
         stats_df = pd.DataFrame(stats_rows)
         stats_df = stats_df[["column", "count", "mean", "std", "min", "q05", "q25", "q50", "q75", "q95", "max"]]
         csv_path = out_dir / "numeric_summary_stats.csv"
-        stats_df.to_csv(csv_path, index=False)
+        stats_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
         print(f"\n[OK] 数値列の基本統計量 CSV を保存しました: {csv_path}")
 
     print("\n=== モード1: 単変量分布の確認 完了 ===")
@@ -679,6 +696,27 @@ class WMWSettings:
     max_sample_per_group: int
     min_n_per_group: int
     calc_cliffs_delta: bool
+
+def ask_auc_threshold(default: float = 0.7) -> float:
+    """AUCのしきい値を尋ねる。空Enterならデフォルト値を返す。"""
+    print("\n[AUCフィルタ設定]")
+    print("  AUC のしきい値を決めて、閾値以上と閾値未満で CSV を分けて保存します。")
+    print(f"  何も入力せず Enter すると、デフォルト値 {default:.2f} を使います。")
+    print("  ※ 0.5〜1.0 の範囲で指定してください。")
+
+    s = input(f"  AUC しきい値 [default={default:.2f}]: ").strip()
+    if not s:
+        print(f"  -> デフォルト値 {default:.2f} を使用します。")
+        return default
+    try:
+        val = float(s)
+    except ValueError:
+        print(f"[WARN] 数値として解釈できませんでした。デフォルト値 {default:.2f} を使用します。")
+        return default
+    if not (0.5 <= val <= 1.0):
+        print(f"[WARN] 0.5〜1.0 の範囲外です。デフォルト値 {default:.2f} を使用します。")
+        return default
+    return val
 
 
 def ask_wmw_settings() -> WMWSettings:
@@ -880,7 +918,7 @@ def run_wmw_pairwise_mode(df: pd.DataFrame, input_path: Path) -> None:
 
     result_df = pd.DataFrame(rows)
     long_path = out_dir / "wmw_results_long.csv"
-    result_df.to_csv(long_path, index=False)
+    result_df.to_csv(long_path, index=False, encoding="utf-8-sig")
     print(f"\n[OK] WMW 結果（ロング形式）CSV を保存しました: {long_path}")
 
     # AUC 行列 (feature × classpair)
@@ -896,8 +934,53 @@ def run_wmw_pairwise_mode(df: pd.DataFrame, input_path: Path) -> None:
         aggfunc="mean",
     )
     auc_matrix_path = out_dir / "auc_matrix_by_feature.csv"
-    auc_matrix.to_csv(auc_matrix_path)
+    auc_matrix.to_csv(auc_matrix_path, encoding="utf-8-sig")
     print(f"[OK] AUC 行列 CSV を保存しました: {auc_matrix_path}")
+
+    # AUC しきい値でフィルタした結果を出力
+    thr = ask_auc_threshold()
+
+    # 閾値以上
+    high_auc = result_df[result_df["auc"] >= thr].copy()
+    if high_auc.empty:
+        print(f"[INFO] AUC >= {thr:.3f} の行は 1 件もありませんでした。")
+    else:
+        filt_ge_path = out_dir / f"wmw_results_auc_ge_{thr:.2f}.csv"
+        high_auc.to_csv(filt_ge_path, index=False, encoding="utf-8-sig")
+        print(
+            f"[OK] AUC >= {thr:.3f} の結果だけを集めた CSV を保存しました: {filt_ge_path}"
+        )
+
+        # 上位の組み合わせをログに要約表示
+        print("\n[SUMMARY] AUC が高い組み合わせ（上位 20 件まで表示・出力は全件）:")
+        top = high_auc.sort_values("auc", ascending=False).head(20)
+        for _, r in top.iterrows():
+            print(
+                f"  {r['feature']} | {r['group1']} vs {r['group2']} | "
+                f"AUC={r['auc']:.3f}, p={r['p_value']:.3g}, "
+                f"n1={int(r['n_group1'])}, n2={int(r['n_group2'])}"
+            )
+
+    # 閾値未満
+    low_auc = result_df[result_df["auc"] < thr].copy()
+    if low_auc.empty:
+        print(f"[INFO] AUC < {thr:.3f} の行は 1 件もありませんでした。")
+    else:
+        filt_lt_path = out_dir / f"wmw_results_auc_lt_{thr:.2f}.csv"
+        low_auc.to_csv(filt_lt_path, index=False, encoding="utf-8-sig")
+        print(
+            f"[OK] AUC < {thr:.3f} の結果だけを集めた CSV を保存しました: {filt_lt_path}"
+        )
+
+        # AUC が低い組み合わせをログに要約表示（下位 20 件）
+        print("\n[SUMMARY] AUC が低い組み合わせ（下位 20 件まで表示・出力は全件）:")
+        top_low = low_auc.sort_values("auc", ascending=True).head(20)
+        for _, r in top_low.iterrows():
+            print(
+                f"  {r['feature']} | {r['group1']} vs {r['group2']} | "
+                f"AUC={r['auc']:.3f}, p={r['p_value']:.3g}, "
+                f"n1={int(r['n_group1'])}, n2={int(r['n_group2'])}"
+            )
 
     print("\n=== モード2: ペアワイズ WMW + AUC 解析 完了 ===")
 
