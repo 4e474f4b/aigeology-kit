@@ -1076,6 +1076,21 @@ def train_mode():
         class_names = sorted(pd.unique(y))
         label_encoder_info = None
 
+    # オプション: 評価結果を地図上で確認するための座標列（x/y）
+    xy_cols = None
+    if ask_yes_no(
+        "\n評価結果を GPKG（ポイント）として出力しますか？\n  → テーブル内に x/y 座標列がある場合のみ有効です。",
+        default=False,
+    ):
+        try:
+            x_col, y_col = ensure_xy_columns(df)
+            xy_cols = (x_col, y_col)
+        except Exception as e:
+            xy_cols = None
+            print(
+                f"  ⚠ x/y 座標列の指定に失敗したため、このセッションでは評価用 GPKG の出力をスキップします: {e}"
+            )
+
     X = df[feature_cols].values.astype(float)
 
     # -------------------------------
@@ -1232,16 +1247,20 @@ def train_mode():
 
         eval_mode = "montecarlo"
         eval_info = {
-            "cv_n_splits": n_splits,
             "test_size": test_size,
             "use_stratify": use_stratify,
+            "n_splits": n_splits,
             "scores": {
-                "accuracy_mean": float(cv_result["test_accuracy"].mean()),
-                "accuracy_std": float(cv_result["test_accuracy"].std()),
-                "f1_macro_mean": float(cv_result["test_f1_macro"].mean()),
-                "f1_macro_std": float(cv_result["test_f1_macro"].std()),
-                "f1_weighted_mean": float(cv_result["test_f1_weighted"].mean()),
-                "f1_weighted_std": float(cv_result["test_f1_weighted"].std()),
+                "accuracy_mean": float(mc_result["test_accuracy"].mean()),
+                "accuracy_std": float(mc_result["test_accuracy"].std()),
+                "f1_macro_mean": float(mc_result["test_f1_macro"].mean()),
+                "f1_macro_std": float(mc_result["test_f1_macro"].std()),
+                "f1_weighted_mean": float(
+                    mc_result["test_f1_weighted"].mean()
+                ),
+                "f1_weighted_std": float(
+                    mc_result["test_f1_weighted"].std()
+                ),
             },
         }
 
@@ -1337,20 +1356,96 @@ def train_mode():
         pipe.fit(X, y)
         print("学習完了。")
 
-        eval_mode = "cv"
-        eval_info = {
-            "cv_n_splits": k_splits,
-            "use_stratify": use_stratify,
-            "scores": {
-                "accuracy_mean": float(cv_result["test_accuracy"].mean()),
-                "accuracy_std": float(cv_result["test_accuracy"].std()),
-                "f1_macro_mean": float(cv_result["test_f1_macro"].mean()),
-                "f1_macro_std": float(cv_result["test_f1_macro"].std()),
-                "f1_weighted_mean": float(cv_result["test_f1_weighted"].mean()),
-                "f1_weighted_std": float(cv_result["test_f1_weighted"].std()),
-            },
-        }
+        # OOF 予測を使った評価（混同行列・classification_report）
+        print("\n[OOF 予測による評価（CV）]")
+        y_oof = cross_val_predict(pipe, X, y, cv=cv, n_jobs=-1)
+        cm = confusion_matrix(y, y_oof)
+        print("混同行列（行: 真, 列: 予測）:")
+        print(cm)
+        print("\nclassification_report:")
 
+        # target_names を安全に決定
+        target_names = None
+        if label_encoder_info and class_names:
+            target_names = [str(c) for c in class_names]
+        elif class_names is not None:
+            target_names = [str(c) for c in class_names]
+
+        if target_names is not None:
+            print(classification_report(y, y_oof, target_names=target_names))
+        else:
+            print(classification_report(y, y_oof))
+
+        # 混同行列の図も保存（OOF ベース）
+        if class_names is not None:
+            cm_labels = [str(c) for c in class_names]
+        else:
+            cm_labels = [str(i) for i in range(cm.shape[0])]
+
+        cm_abs_path = out_dir / f"rf_confusion_matrix_cv_oof_{run_id}.png"
+        cm_norm_path = (
+            out_dir / f"rf_confusion_matrix_cv_oof_normalized_{run_id}.png"
+        )
+        _plot_confusion_matrix(
+            cm,
+            cm_labels,
+            normalize=False,
+            title="Confusion matrix (CV oof)",
+            save_path=cm_abs_path,
+        )
+        _plot_confusion_matrix(
+            cm,
+            cm_labels,
+            normalize=True,
+            title="Confusion matrix (normalized, CV oof)",
+            save_path=cm_norm_path,
+        )
+
+        # オプション: クロスバリデーション OOF 予測を GPKG（ポイント）として保存
+        if xy_cols is not None:
+            x_col, y_col = xy_cols
+            if (x_col in df.columns) and (y_col in df.columns):
+                eval_df = df.copy()
+                eval_df["true_label"] = df[target_col].values
+                if label_encoder_info is not None:
+                    # y_oof はエンコード後の整数ラベルなので decode して保存
+                    pred_labels = le.inverse_transform(y_oof)
+                else:
+                    pred_labels = y_oof
+                eval_df["pred_label"] = pred_labels
+                eval_df["is_correct"] = (
+                    eval_df["true_label"] == eval_df["pred_label"]
+                )
+
+                print(
+                    "\n[オプション] CV OOF 評価結果を GPKG として保存します。"
+                )
+                crs_epsg = ask_crs(default_epsg=None)
+                eval_cv_gpkg_path = (
+                    out_dir / f"{base.stem}_eval_cv_oof_{run_id}.gpkg"
+                )
+                save_gpkg_with_points(
+                    eval_df,
+                    eval_cv_gpkg_path,
+                    x_col=x_col,
+                    y_col=y_col,
+                    crs_epsg=crs_epsg,
+                    layer_name="eval_cv_oof",
+                )
+                print(f"[保存] CV OOF 評価 GPKG: {eval_cv_gpkg_path}")
+            else:
+                eval_cv_gpkg_path = None
+                print(
+                    "  ⚠ 指定された座標列が df に存在しないため、CV 用 GPKG の出力をスキップします。"
+                )
+        else:
+            eval_cv_gpkg_path = None
+
+        # 最終モデルは全データでフィット
+        print("\n[最終モデルの学習（全データで再学習）...]")
+        pipe.fit(X, y)
+        print("学習完了。")
+         
     else:
         # ===== ホールドアウト法 =====
         print("\n[学習データ分割設定（ホールドアウト）]")
@@ -1364,24 +1459,25 @@ def train_mode():
         else:
             test_size = 0.2
 
-        stratify = y if use_stratify else None
+        if use_stratify:
+            stratify_arr = y
+        else:
+            stratify_arr = None
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size,
-            random_state=random_state, stratify=stratify
+        indices = np.arange(len(df))
+        idx_train, idx_test = train_test_split(
+            indices,
+            test_size=test_size,
+            random_state=random_state,
+            stratify=stratify_arr,
         )
+
+        X_train, X_test = X[idx_train], X[idx_test]
+        y_train, y_test = y[idx_train], y[idx_test]
 
         print("\n[学習中...]")
         pipe.fit(X_train, y_train)
         print("学習完了。")
-
-        # 評価（テストデータ）
-        print("\n[評価（ホールドアウトのテストデータ）]")
-        y_pred = pipe.predict(X_test)
-        cm = confusion_matrix(y_test, y_pred)
-        print("混同行列（行: 真, 列: 予測）:")
-        print(cm)
-        print("\nclassification_report:")
 
         if label_encoder_info and class_names:
             # 学習時に使ったクラスIDをすべて評価対象にする
@@ -1416,11 +1512,53 @@ def train_mode():
             save_path=cm_norm_path,
         )
 
+        # オプション: テストデータの評価結果を GPKG（ポイント）として保存
+        if xy_cols is not None:
+            x_col, y_col = xy_cols
+            if (x_col in df.columns) and (y_col in df.columns):
+                eval_df = df.iloc[idx_test].copy()
+                eval_df["true_label"] = df[target_col].iloc[idx_test].values
+                if label_encoder_info is not None:
+                    # y_pred はエンコード後の整数ラベルなので decode して保存
+                    pred_labels = le.inverse_transform(y_pred)
+                else:
+                    pred_labels = y_pred
+                eval_df["pred_label"] = pred_labels
+                eval_df["is_correct"] = (
+                    eval_df["true_label"] == eval_df["pred_label"]
+                )
+
+                print(
+                    "\n[オプション] テストデータ評価結果を GPKG として保存します。"
+                )
+                crs_epsg = ask_crs(default_epsg=None)
+                eval_gpkg_path = (
+                    out_dir / f"{base.stem}_eval_test_{run_id}.gpkg"
+                )
+                save_gpkg_with_points(
+                    eval_df,
+                    eval_gpkg_path,
+                    x_col=x_col,
+                    y_col=y_col,
+                    crs_epsg=crs_epsg,
+                    layer_name="eval_test",
+                )
+                print(f"[保存] テスト評価 GPKG: {eval_gpkg_path}")
+            else:
+                eval_gpkg_path = None
+                print(
+                    "  ⚠ 指定された座標列が df に存在しないため、評価用 GPKG の出力をスキップします。"
+                )
+        else:
+            eval_gpkg_path = None
+
         eval_mode = "holdout"
         eval_info = {
             "test_size": test_size,
             "use_stratify": use_stratify,
         }
+        if eval_gpkg_path is not None:
+            eval_info["eval_gpkg_path"] = str(eval_gpkg_path)
 
     # モデル保存パラメータまとめ
     train_params = {
