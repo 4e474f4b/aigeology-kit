@@ -1093,11 +1093,15 @@ def main():
         # 表示用：Box窓・Gaussσ の換算例は「R_smooth = R_eff」を代表として出す
         Rsm = max(1e-6, R_eff)
         k_box = _winpix_from_meters(Rsm, px, min_win=3, odd=True)  # ≈ 2*Rsm/px + 1
-        sigma_px = max(0.5, float(Rsm) / (3.0 * float(px)))        
-        print(f"    ・R={R:.3g}m → R_eff≒{R_eff:.3g}m")
-        print(f"       推奨候補（m）: {', '.join(f'{v:.0f}' for v in guide_sets[i])}")
-        print(f"       例）R_smooth={R_eff:.0f}m の場合: Box窓≈{k_box}、Gauss σ≈{sigma_px:.2f}px")
-    print("  （※Box は有効半径≒R_smooth、Gauss は 3σ≒R_smooth を目安）\n")
+        sigma_px = max(0.5, float(Rsm) / (3.0 * float(px)))
+        width_m = k_box * px  # Box窓の物理幅 [m]（概ね「見ている範囲」）
+
+        print(f"    ・比高スケール R={R:.3g}m（窓サイズ ≒{k_box}ピクセル ≒{width_m:.3g}m）")
+        print(f"       → 平滑化の有効半径の代表値 R_eff≒{R_eff:.3g}m")
+        print(f"       推奨候補（R_smooth[m]）: {', '.join(f'{v:.0f}' for v in guide_sets[i])}")
+        print(f"       例）R_smooth={R_eff:.0f}m の場合: Box窓≈{k_box}ピクセル（幅≒{width_m:.3g}m）, Gauss σ≈{sigma_px:.2f}px")
+    print("  （※ここでの R_smooth は『平滑化の有効半径[m]』です。"
+          "Box 窓の物理幅≒2×R_smooth≒比高 R となるように設計しています）\n")
     print("  1: 生DEMのみで計算（従来通り）")
     print("  2: 生DEM + スムージング版も出力")
     print("  3: スムージング版のみ出力")
@@ -1115,15 +1119,37 @@ def main():
 
         print("\n  [平滑化スケールの指定方法]")
         print("    1: 距離 [m] で指定（例: 10,30,50）")
-        print("    2: ピクセル数 [px] で指定（例: 5,11,21）")
+        print("    2: ピクセル数 [px] で指定（例: 3,5,11）")
         sm_mode = ask_int("番号を選んでください", 1)
 
         if sm_mode == 1:
-            # デフォルトは最初の R_eff セットの先頭（≒完全整合）を提示
-            default_ms = guide_sets[0] if guide_sets else [10.0]
+            # --- 平滑化スケール R_smooth[m] のデフォルトの考え方 ---
+            # guide_sets は「各 比高 R に対応する推奨平滑化半径の候補リスト」の集合。
+            #   例）比高 R が1つ（R=6m）のとき: guide_sets = [[2.0, 1.0]]
+            #       比高 R が2つ（R=6m, 15m）のとき: guide_sets = [[2.0, 1.0], [5.0, 3.0]]
+            #
+            # ポリシー:
+            #   ・比高 R が 1 つだけ → その R に対応する「先頭の値」だけをデフォルトにする（例: [2.0]）
+            #   ・比高 R が複数      → 各 R に対応する「先頭の値」だけを並べたリストをデフォルトにする（例: [2.0, 5.0]）
+            #   ・guide_sets が空    → フォールバックとして [10.0] を採用
+            if not guide_sets:
+                default_ms = [10.0]
+            else:
+                n_r = len(guide_sets)
+                if n_r == 1:
+                    # 1スケールのみ指定された場合は、そのスケールの先頭値のみを提示
+                    default_ms = [guide_sets[0][0]]
+                else:
+                    # 複数スケールの場合は、各スケールの先頭値だけを並べて提示
+                    default_ms = [g[0] for g in guide_sets]
+
             smooth_r_list = ask_float_list(
                 "平滑化スケール R_smooth[m]（カンマ区切り可, 例: 10,30,50）\n"
-                "    ※上の『推奨候補（m）』から選ぶと比高スケールと整合します。",
+                "    ※ここで指定する R_smooth は「平滑化の有効半径[m]」です。\n"
+                "      上で表示された『推奨候補（m）』のうち先頭の値を選ぶと、\n"
+                "      比高 R と勾配・曲率の平滑化が、ほぼ同じ空間スケール\n"
+                "      （窓幅 ≒ 比高の R）を見るように調整されています。\n"
+                "      （例：2mDEM で R=6m のとき、R_smooth=2m → 3×3窓（幅≒6m））",
                 default_ms,
             )
         else:
