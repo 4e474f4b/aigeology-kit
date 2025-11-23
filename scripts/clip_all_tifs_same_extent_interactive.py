@@ -362,6 +362,34 @@ def clamp_intersection(a: BoundingBox, b: BoundingBox) -> Optional[BoundingBox]:
     if (xmax <= xmin) or (ymax <= ymin): return None
     return BoundingBox(left=xmin, bottom=ymin, right=xmax, top=ymax)
 
+
+def choose_blocksize(width: int, height: int, max_block: int = 512) -> Tuple[Optional[int], Optional[int]]:
+    """
+    GTiff ドライバの制約:
+      - タイルサイズは 16 の倍数 かつ 画像サイズ以下
+    これを満たす blockxsize / blockysize を決める。
+    どちらか一方でも 16 未満になってしまう場合は None を返し、
+    （＝タイル化しない／strip に任せる方向）
+    """
+    if width <= 0 or height <= 0:
+        return None, None
+
+    # 16px 未満しかない極小画像はタイル化しない
+    if width < 16 or height < 16:
+        return None, None
+
+    bx = min(max_block, width)
+    by = min(max_block, height)
+
+    # 16 の倍数に丸める（下方向）
+    bx = (bx // 16) * 16
+    by = (by // 16) * 16
+
+    if bx < 16 or by < 16:
+        return None, None
+
+    return bx, by
+
 # ---------- clean helpers ----------
 def clean_tif_gdal(src: str, dst: str) -> None:
     """元TIFを 'きれいな' GTiff に再出力（RAT/GCPを除去）"""
@@ -568,17 +596,32 @@ def main():
                                             data, transform = rio_mask(mem, shapes=geoms_dst, crop=crop_when_mask, nodata=mem.nodata)
 
                         profile = src.profile.copy()
+                        # 出力サイズに合わせてタイルサイズを決定
+                        out_height = data.shape[1]
+                        out_width  = data.shape[2]
+                        bx, by = choose_blocksize(out_width, out_height)
+
                         profile.update({
-                            "height": data.shape[1],
-                            "width": data.shape[2],
+                            "height": out_height,
+                            "width":  out_width,
                             "transform": transform,
-                            "tiled": True,
-                            "blockxsize": min(512, data.shape[2]),
-                            "blockysize": min(512, data.shape[1]),
                             "compress": "DEFLATE",
                             "predictor": 3,
                             "BIGTIFF": "IF_SAFER",
                         })
+
+                        # 16 の倍数ブロックが取れるときだけタイル化する
+                        if bx is not None and by is not None:
+                            profile.update({
+                                "tiled": True,
+                                "blockxsize": bx,
+                                "blockysize": by,
+                            })
+                        else:
+                            # タイル指定があるとエラーになるので削除
+                            profile.pop("tiled", None)
+                            profile.pop("blockxsize", None)
+                            profile.pop("blockysize", None)
                         with rasterio.open(out_path, "w", **profile) as dst:
                             dst.write(data)
 
