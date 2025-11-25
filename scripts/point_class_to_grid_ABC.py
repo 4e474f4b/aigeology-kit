@@ -219,9 +219,14 @@ def assign_classes_A_nearest(
     """
     print("\n[INFO] A方式：最近傍でクラスを割り当てます（Nearest Neighbor）。")
 
+    # クラス欠損・geometry欠損を除外
+    g = points_gdf.copy()
+    g = g[g.geometry.notnull()].copy()
+    g = g[~g[class_col].isna()].copy()
+
     # 点座標とクラス
-    pts_xy = np.vstack([points_gdf.geometry.x.values, points_gdf.geometry.y.values]).T
-    pts_class = points_gdf[class_col].values
+    pts_xy = np.vstack([g.geometry.x.values, g.geometry.y.values]).T
+    pts_class = g[class_col].values
 
     if len(pts_xy) == 0:
         print("[ERROR] 点が1つも存在しません。")
@@ -290,12 +295,24 @@ def assign_classes_B_radius_majority(
             assigned_class.append(np.nan)
             n_points_list.append(0)
         else:
-            cls = pts_class[idxs]
+            cls_raw = pts_class[idxs]
+            # None / NaN を除外
+            cls_clean = [
+                c for c in cls_raw
+                if (c is not None) and not (isinstance(c, float) and np.isnan(c))
+            ]
+
+            if len(cls_clean) == 0:
+                # 有効なクラスが1つも無ければ「未分類セル」とする
+                assigned_class.append(np.nan)
+                n_points_list.append(0)
+                continue
+
             # 最頻値（多数決）
-            values, counts = np.unique(cls, return_counts=True)
+            values, counts = np.unique(cls_clean, return_counts=True)
             majority_class = values[np.argmax(counts)]
             assigned_class.append(majority_class)
-            n_points_list.append(len(cls))
+            n_points_list.append(len(cls_clean))
 
     grid_gdf = grid_gdf.copy()
     grid_gdf[class_col] = assigned_class
@@ -383,31 +400,40 @@ def assign_classes_C_weighted_majority(
     print("[OK] C方式のクラス割り当てが完了しました。")
     return grid_gdf
 
-
 def dissolve_by_class(grid_gdf: gpd.GeoDataFrame, class_col: str) -> gpd.GeoDataFrame:
     """
     グリッドポリゴンを地形種別ごとに dissolve する。
     - クラスが NaN のセルは除外してから dissolve する。
+    - GeoDataFrame.dissolve() / Shapely の union 系で TypeError が出る環境では、
+      無理に union せず「dissolve レイヤは空のまま返す」ようにして処理継続を優先する。
     """
     print("\n[INFO] クラスごとに dissolve（面マージ）を実行します。")
 
-    g = grid_gdf.dropna(subset=[class_col])
+    # クラスが NaN のセルは除外
+    g = grid_gdf.dropna(subset=[class_col]).copy()
     if g.empty:
         print("[WARN] クラスが有効なセルが存在しないため、dissolve をスキップします。")
-        return gpd.GeoDataFrame(columns=["geometry", class_col, "n_cells", "n_points"])
+        return gpd.GeoDataFrame(columns=["geometry", class_col, "n_cells", "n_points"], crs=grid_gdf.crs)
+
+    # 念のため geometry の NaN も除外
+    g = g[g.geometry.notnull()].copy()
 
     if "n_points" not in g.columns:
         g["n_points"] = 1
 
-    dissolved = g.dissolve(by=class_col, as_index=True, aggfunc={"n_points": "sum"})
-    count_cells = g.groupby(class_col).size()
-    dissolved["n_cells"] = count_cells
-
-    dissolved[class_col] = dissolved.index
-    dissolved = dissolved.reset_index(drop=True)
-
-    print(f"[OK] dissolve 完了（{len(dissolved)} クラス）。")
-    return dissolved
+    try:
+        dissolved = g.dissolve(by=class_col, as_index=True, aggfunc={"n_points": "sum"})
+        count_cells = g.groupby(class_col).size()
+        dissolved["n_cells"] = count_cells
+        dissolved[class_col] = dissolved.index
+        dissolved = dissolved.reset_index(drop=True)
+        print(f"[OK] dissolve 完了（{len(dissolved)} クラス）。")
+        return dissolved
+    except TypeError as e:
+        print("[WARN] dissolve 実行中に TypeError が発生しました。dissolve レイヤは作成せずスキップします。")
+        print(f"       詳細: {e}")
+        # 空の GeoDataFrame を返して呼び出し側に処理を継続させる
+        return gpd.GeoDataFrame(columns=["geometry", class_col, "n_cells", "n_points"], crs=grid_gdf.crs)
 
 
 # ============================================================
