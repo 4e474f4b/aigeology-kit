@@ -193,6 +193,61 @@ def ask_crs(default_epsg="EPSG:4326"):
         except Exception as e:
             print(f"⚠ その指定は解釈できませんでした: {e}\nもう一度入力してください。")
 
+def print_output_format_guide(df):
+    """
+    DataFrame の行数・列数と、PC のメモリ搭載量（取得できれば）から
+    推奨される出力形式の目安を表示する。
+    """
+    import math
+
+    n_rows = len(df)
+    n_cols = len(df.columns)
+
+    # 「全部 float64 だったとしたら」くらいの雑な見積もり
+    # 8 byte/セル × 安全係数 1.5
+    est_gb = n_rows * n_cols * 8 * 1.5 / (1024 ** 3)
+
+    print("\n[INFO] 学習用テーブルのサイズ目安")
+    print(f"  行数: {n_rows:,}")
+    print(f"  列数: {n_cols:,}")
+    print(f"  メモリ使用の概算: 約 {est_gb:.2f} GB（float64 相当）")
+
+    total_ram_gb = None
+    try:
+        import psutil
+        total_ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+        print(f"  このPCの実メモリ: 約 {total_ram_gb:.1f} GB")
+    except Exception:
+        # psutil が無い場合は RAM 情報なしで続行
+        pass
+
+    print("\n[ガイド] 推奨される出力形式の目安:")
+
+    if total_ram_gb is not None:
+        ratio = est_gb / max(total_ram_gb, 0.1)
+        if ratio > 0.7:
+            print("  - GPKG への直接出力は非推奨（ほぼ確実に重くなります）。")
+            print("  - まず .parquet を推奨（必要に応じて後で一部を GPKG 化）。")
+        elif ratio > 0.4:
+            print("  - GPKG 出力はかなり重くなる可能性があります。")
+            print("  - .parquet / .csv を基本とし、確認用だけ GPKG にするのを推奨。")
+        else:
+            print("  - どの形式でも扱えるサイズですが、性能面では .parquet 推奨。")
+    else:
+        # RAM 不明な場合は絶対値でざっくり
+        if est_gb > 8:
+            print("  - GPKG への直接出力は非推奨（概算で 8GB 超）。")
+            print("  - まず .parquet を推奨。")
+        elif est_gb > 4:
+            print("  - GPKG 出力はかなり重くなる可能性があります。")
+            print("  - .parquet / .csv を基本とした方が安全です。")
+        else:
+            print("  - どの形式でも扱えますが、.parquet が最も実務的です。")
+
+    print("  - 学習や予測だけが目的なら geometry 不要 → .parquet / .csv で十分です。")
+    print("  - QGIS で確認したい場合だけ、絞り込んだ点群を GPKG に変換してください。\n")
+
+
 def setup_matplotlib_japanese_font():
     import matplotlib
     import matplotlib.font_manager as fm
@@ -897,27 +952,59 @@ def make_training_data_mode():
             print("   ラスターからのサンプリングはスキップします。")
             rasters = []
 
+    # すべてのラスターで共通に使う座標リスト（事前に1回だけ作成）
+    coords = list(zip(df["x"].values, df["y"].values))
+
+    # ここに「列名 → 値配列」を貯めて、最後に一括で df に結合する
+    cols_dict = {}
+
     for r_path in rasters:
         import rasterio
-        with rasterio.open(r_path) as src:
-            if base_crs is None:
-                base_crs = src.crs
-            else:
-                if src.crs != base_crs:
-                    raise RuntimeError(f"CRS が一致しません: {r_path} ({src.crs}) != {base_crs}")
-            coords = list(zip(df["x"].values, df["y"].values))
-            vals = list(src.sample(coords))
-            arr = np.array(vals)
-            if arr.ndim == 1:
-                arr = arr.reshape(-1, 1)
-            stem = r_path.stem
-            for b in range(arr.shape[1]):
-                col = f"{stem}_b{b+1}"
-                df[col] = arr[:, b]
-            nodata = src.nodata
-            if nodata is not None:
-                df.replace(nodata, np.nan, inplace=True)
+
+        # ファイルが途中で消えている / パスがおかしい場合をスキップ
+        if not r_path.exists():
+            print(f"  [WARN] ラスターが見つかりませんでした（スキップ）: {r_path}")
+            continue
+
+        try:
+            with rasterio.open(r_path) as src:
+                if base_crs is None:
+                    base_crs = src.crs
+                else:
+                    if src.crs != base_crs:
+                        raise RuntimeError(
+                            f"CRS が一致しません: {r_path} ({src.crs}) != {base_crs}"
+                        )
+
+                # サンプリングして ndarray 化
+                vals = np.array(list(src.sample(coords)))
+                if vals.ndim == 1:
+                    vals = vals.reshape(-1, 1)
+
+                # nodata → NaN に置き換え（この時点で配列側に反映しておく）
+                nodata = src.nodata
+                if nodata is not None:
+                    vals = np.where(vals == nodata, np.nan, vals)
+
+                stem = r_path.stem
+                for b in range(vals.shape[1]):
+                    col = f"{stem}_b{b+1}"
+                    cols_dict[col] = vals[:, b]
+
+        except rasterio.errors.RasterioIOError as e:
+            print(
+                f"  [WARN] ラスターを開けませんでした（スキップ）: {r_path}\n"
+                f"         → {e}"
+            )
+            continue
+
         print(f"  [OK] {r_path.name} をサンプリングして特徴量列を追加しました。")
+
+    # まとめて DataFrame に結合（断片化を避ける）
+    if cols_dict:
+        feat_df = pd.DataFrame(cols_dict, index=df.index)
+        df = pd.concat([df, feat_df], axis=1)
+        df = df.copy()  # fragmentation を解消
 
     # --- ポリゴン属性の付与 ---
     if poly_for_attr is not None:
@@ -971,6 +1058,9 @@ def make_training_data_mode():
             print(f"  → ポリゴン属性を付与しました（列数: {len(attr_cols) if attr_cols else 0}）")
 
     # --- 出力 ---
+    # 行数・列数と概算メモリから、推奨される出力形式をガイド表示
+    print_output_format_guide(df)
+
     print("\n[出力]")  # out_path / out_suffix は関数冒頭で取得済み
     if out_suffix in [".parquet", ".pq"]:
         try:
