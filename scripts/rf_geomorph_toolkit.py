@@ -193,15 +193,19 @@ def ask_crs(default_epsg="EPSG:4326"):
         except Exception as e:
             print(f"⚠ その指定は解釈できませんでした: {e}\nもう一度入力してください。")
 
-def print_output_format_guide_from_shape(n_rows: int, n_cols: int):
+def print_output_format_guide_from_shape(n_rows, n_cols):
     """
-    行数・列数と、PC のメモリ搭載量（取得できれば）から
-    推奨される出力形式の目安を表示する。
+    df 全体をまだ作っていない段階で、
+    行数と列数の「見込み」から出力形式のガイドを出す版。
+
+    Parameters
+    ----------
+    n_rows : int
+        想定される行数
+    n_cols : int
+        想定される列数
     """
     import math
-
-    n_rows = len(df)
-    n_cols = len(df.columns)
 
     # 「全部 float64 だったとしたら」くらいの雑な見積もり
     # 8 byte/セル × 安全係数 1.5
@@ -1128,7 +1132,7 @@ def make_training_data_mode():
         else:
             def_str = "EPSG:4326"
         crs_epsg = ask_crs(default_epsg=def_str)
-        savels _gpkg_with_points(df, out_path, x_col="x", y_col="y",
+        savels_gpkg_with_points(df, out_path, x_col="x", y_col="y",
                               crs_epsg=crs_epsg, layer_name="train")
         print(f"✅ GPKG を書き出しました: {out_path}")
     else:
