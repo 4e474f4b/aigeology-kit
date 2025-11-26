@@ -857,6 +857,8 @@ def make_training_data_mode():
 
     # 属性を付与するポリゴンGPKG（任意）
     poly_for_attr: Path | None = None
+    poly_attr_cols: list[str] | None = None
+    selected_poly_attr_cols: list[str] | None = None
     if polygons:
         ans = input("ポリゴンGPKGの属性値も特徴量/ラベルとして付与しますか？ [y/N]: ").strip().lower() or "n"
         if ans.startswith("y"):
@@ -869,7 +871,7 @@ def make_training_data_mode():
             if not p_idx or p_idx.lower() in {"null", "none"}:
                 print("  ポリゴン属性は使用しません。")
             else:
-                m = re.fullmatch(r"[Pp](\d+)", p_idx)
+                m = re.fullmatch(r"[Pp](\\d+)", p_idx)
                 if m:
                     p_idx = m.group(1)
                 try:
@@ -879,8 +881,51 @@ def make_training_data_mode():
                 else:
                     if 0 <= p_i < len(polygons):
                         poly_for_attr = polygons[p_i]
+                        # ここで属性列の一覧表示と選択も行う
+                        try:
+                            import geopandas as gpd
+                        except ImportError:
+                            print("  ⚠ geopandas がインポートできないため、ポリゴン属性は付与しません。")
+                            poly_for_attr = None
+                        else:
+                            try:
+                                poly_gdf_preview = gpd.read_file(poly_for_attr)
+                            except Exception as e:
+                                print(f"  ⚠ ポリゴン属性の列情報を取得できませんでした: {e}")
+                                poly_for_attr = None
+                            else:
+                                attr_cols = [c for c in poly_gdf_preview.columns if c.lower() not in {"geometry"}]
+                                if not attr_cols:
+                                    print("  ⚠ 利用可能な属性列がありません（geometry のみ）。")
+                                    poly_attr_cols = None
+                                else:
+                                    print(f"\\n[INFO] ポリゴン属性の付与: {poly_for_attr}")
+                                    print("  利用可能な属性列:")
+                                    for i, c in enumerate(attr_cols):
+                                        print(f"    [{i:02d}] {c}")
+                                    sel = input("  付与する属性列の番号（カンマ区切り、空=全て）: ").strip()
+                                    if sel:
+                                        idxs: list[int] = []
+                                        for tok in sel.split(","):
+                                            tok = tok.strip()
+                                            if not tok:
+                                                continue
+                                            try:
+                                                idxs.append(int(tok))
+                                            except ValueError:
+                                                print(f"    ⚠ 無視します: '{tok}'")
+                                        selected_poly_attr_cols = [
+                                            attr_cols[i] for i in idxs if 0 <= i < len(attr_cols)
+                                        ]
+                                        if not selected_poly_attr_cols:
+                                            print("  ⚠ 有効な番号が指定されなかったため、全ての属性列を使用します。")
+                                            selected_poly_attr_cols = attr_cols
+                                    else:
+                                        selected_poly_attr_cols = attr_cols
                     else:
                         print("  ⚠ 範囲外の番号なのでポリゴン属性は使用しません。")
+        else:
+            print("  ポリゴン属性は使用しません。")
 
     # --- 範囲の決定 ---
     print("\n[範囲の決め方]")
@@ -1060,47 +1105,43 @@ def make_training_data_mode():
         df = pd.concat([df, feat_df], axis=1)
         df = df.copy()  # fragmentation を解消
 
-    # --- ポリゴン属性の付与 ---
+    # ポリゴン属性の付与（任意）
     if poly_for_attr is not None:
-        from shapely.geometry import Point
+        print("\n[INFO] ポリゴン属性の付与:", poly_for_attr)
+        import geopandas as gpd
+        from shapely.geometry import Point as ShapelyPoint
 
-        print(f"\n[INFO] ポリゴン属性の付与: {poly_for_attr}")
         poly_gdf = gpd.read_file(poly_for_attr)
-        if base_crs is not None and poly_gdf.crs is not None:
-            try:
-                poly_gdf = poly_gdf.to_crs(base_crs)
-            except Exception as e:
-                print(f"⚠ CRSの変換に失敗しました: {e}\n   ポリゴン属性の付与をスキップします。")
-                poly_gdf = None
-        if poly_gdf is not None:
-            attr_cols = [c for c in poly_gdf.columns if c != "geometry"]
-            if attr_cols:
-                print("  利用可能な属性列:")
-                for i, c in enumerate(attr_cols):
-                    print(f"    [{i:02d}] {c}")
-                sel = input("  付与する属性列の番号（カンマ区切り、空=全て）: ").strip()
-                if sel:
-                    idxs: list[int] = []
-                    for tok in sel.split(","):
-                        tok = tok.strip()
-                        if not tok:
-                            continue
-                        try:
-                            idxs.append(int(tok))
-                        except ValueError:
-                            print(f"    ⚠ 無視します: '{tok}'")
-                    attr_cols = [attr_cols[i] for i in idxs if 0 <= i < len(attr_cols)]
-            else:
-                print("  ⚠ 利用可能な属性列がありません（geometry のみ）。")
+        if poly_gdf.crs is None:
+            poly_gdf.set_crs(base_crs, inplace=True)
+        elif poly_gdf.crs != base_crs:
+            poly_gdf = poly_gdf.to_crs(base_crs)
 
-            pts_gdf = gpd.GeoDataFrame(
-                df.copy(),
-                geometry=[Point(xy) for xy in zip(df["x"].values, df["y"].values)],
-                crs=poly_gdf.crs,
-            )
+        # 利用する属性列（事前に選択された列を優先）
+        attr_candidates = [c for c in poly_gdf.columns if c.lower() not in {"geometry"}]
+        if not attr_candidates:
+            print("  ⚠ 利用可能な属性列がありません（geometry のみ）。ポリゴン属性の付与はスキップします。")
+        else:
+            if selected_poly_attr_cols:
+                attr_cols = [c for c in selected_poly_attr_cols if c in attr_candidates]
+                if not attr_cols:
+                    print("  ⚠ 事前に選択された属性列がポリゴンに存在しません。全ての属性列を使用します。")
+                    attr_cols = attr_candidates
+            else:
+                attr_cols = attr_candidates
+
+            print("  使用する属性列:", ", ".join(attr_cols))
+
+            # サンプル点を GeoDataFrame に変換
+            df_points = df[["x", "y"]].copy()
+            df_points = df_points.dropna(subset=["x", "y"])
+            pts_geom = [ShapelyPoint(xy) for xy in zip(df_points["x"], df_points["y"])]
+            pts_gdf = gpd.GeoDataFrame(df_points, geometry=pts_geom, crs=base_crs)
+
+            # sjoin でポリゴン属性を付与
             joined = gpd.sjoin(
                 pts_gdf,
-                poly_gdf[attr_cols + ["geometry"]] if attr_cols else poly_gdf,
+                poly_gdf[attr_cols + ["geometry"]],
                 how="left",
                 predicate="intersects",
             )
@@ -1108,13 +1149,10 @@ def make_training_data_mode():
             joined = joined.drop(columns=drop_cols)
             if "geometry" in joined.columns:
                 joined = joined.drop(columns=["geometry"])
-            df = pd.DataFrame(joined)
-            print(f"  → ポリゴン属性を付与しました（列数: {len(attr_cols) if attr_cols else 0}）")
+            df = joined.reset_index(drop=True)
+            print(f"  → ポリゴン属性を付与しました（列数: {len(attr_cols)}）")
 
     # --- 出力 ---
-    # 最終テーブルのサイズ目安（実際の列数）を一度表示
-    print_output_format_guide(df)
-
     print("\n[出力]")
     if out_suffix in [".parquet", ".pq"]:
         try:
