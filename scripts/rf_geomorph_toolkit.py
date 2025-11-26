@@ -193,9 +193,9 @@ def ask_crs(default_epsg="EPSG:4326"):
         except Exception as e:
             print(f"⚠ その指定は解釈できませんでした: {e}\nもう一度入力してください。")
 
-def print_output_format_guide(df):
+def print_output_format_guide_from_shape(n_rows: int, n_cols: int):
     """
-    DataFrame の行数・列数と、PC のメモリ搭載量（取得できれば）から
+    行数・列数と、PC のメモリ搭載量（取得できれば）から
     推奨される出力形式の目安を表示する。
     """
     import math
@@ -246,6 +246,15 @@ def print_output_format_guide(df):
 
     print("  - 学習や予測だけが目的なら geometry 不要 → .parquet / .csv で十分です。")
     print("  - QGIS で確認したい場合だけ、絞り込んだ点群を GPKG に変換してください。\n")
+
+
+def print_output_format_guide(df):
+    """
+    DataFrame の行数・列数からガイドを出すラッパー（後方互換用）。
+    """
+    n_rows = len(df)
+    n_cols = len(df.columns)
+    print_output_format_guide_from_shape(n_rows, n_cols)
 
 
 def setup_matplotlib_japanese_font():
@@ -768,12 +777,19 @@ def make_training_data_mode():
         print("ディレクトリが見つかりません。終了します。")
         return
 
-    # --- 出力先の指定（先に聞いておく） ---
-    out_path = strip_quotes(input("学習用テーブルの出力パス（.csv / .parquet / .gpkg）: ").strip())
-    if not out_path:
-        print("出力パスが指定されていません。終了します。")
+    # --- 出力先の指定（ベースパスのみ先に聞いておく） ---
+    base_out = strip_quotes(input(
+        "学習用テーブルの出力ベースパス（拡張子なし。例: E:\\AiGeology\\train\\A-train）: "
+    ).strip())
+    if not base_out:
+        print("出力ベースパスが指定されていません。終了します。")
         return
-    out_suffix = Path(out_path).suffix.lower()
+
+    # 万一 .csv など拡張子付きで入力された場合は、拡張子を取り除いてベースパス扱いにする
+    base_out_path = Path(base_out)
+    if base_out_path.suffix:
+        print(f"[INFO] 拡張子 {base_out_path.suffix} は無視し、ベースパスとして扱います。")
+        base_out_path = base_out_path.with_suffix("")
 
     # --- ラスター/ポリゴンの探索 ---
     raster_exts = (".tif", ".tiff", ".img")
@@ -840,19 +856,27 @@ def make_training_data_mode():
     if polygons:
         ans = input("ポリゴンGPKGの属性値も特徴量/ラベルとして付与しますか？ [y/N]: ").strip().lower() or "n"
         if ans.startswith("y"):
-            p_idx = input("  使用するポリゴンGPKGの番号（例: 0 または P0。空=0）: ").strip()
-            if p_idx:
+            p_idx = input(
+                "  使用するポリゴンGPKGの番号 "
+                "（例: 0 または P0。null/空=使用しない）: "
+            ).strip()
+
+            # null / none / 空文字 → 使用しない
+            if not p_idx or p_idx.lower() in {"null", "none"}:
+                print("  ポリゴン属性は使用しません。")
+            else:
                 m = re.fullmatch(r"[Pp](\d+)", p_idx)
                 if m:
                     p_idx = m.group(1)
-            try:
-                p_i = int(p_idx) if p_idx else 0
-            except ValueError:
-                p_i = 0
-            if 0 <= p_i < len(polygons):
-                poly_for_attr = polygons[p_i]
-            else:
-                print("  ⚠ 範囲外の番号なのでポリゴン属性は使用しません。")
+                try:
+                    p_i = int(p_idx)
+                except ValueError:
+                    print("  ⚠ 番号が不正なのでポリゴン属性は使用しません。")
+                else:
+                    if 0 <= p_i < len(polygons):
+                        poly_for_attr = polygons[p_i]
+                    else:
+                        print("  ⚠ 範囲外の番号なのでポリゴン属性は使用しません。")
 
     # --- 範囲の決定 ---
     print("\n[範囲の決め方]")
@@ -889,15 +913,21 @@ def make_training_data_mode():
                 print("\n[範囲用ポリゴンの選択]")
                 for i, g in enumerate(polygons):
                     print(f"  [P{i:02d}] {g}")
-                p_idx = input("範囲用ポリゴンGPKGの番号（例: 0 または P0。空=0）: ").strip()
-                if p_idx:
-                    m = re.fullmatch(r"[Pp](\d+)", p_idx)
-                    if m:
-                        p_idx = m.group(1)
+                p_idx = input("範囲用ポリゴンGPKGの番号（例: 0 または P0）: ").strip()
+
+                if not p_idx:
+                    print("番号が空です。範囲 2) を選んだ場合は必ずどれかを指定してください。")
+                    print("必要なければ、範囲 1) 手動入力 を選んでください。")
+                    return
+
+                m = re.fullmatch(r"[Pp](\d+)", p_idx)
+                if m:
+                    p_idx = m.group(1)
                 try:
-                    p_i = int(p_idx) if p_idx else 0
+                    p_i = int(p_idx)
                 except ValueError:
-                    p_i = 0
+                    print("番号が不正です。終了します。")
+                    return
                 if not (0 <= p_i < len(polygons)):
                     print("番号が不正です。終了します。")
                     return
@@ -941,6 +971,26 @@ def make_training_data_mode():
     XX, YY = np.meshgrid(xs, ys)
     df = pd.DataFrame({"x": XX.ravel(), "y": YY.ravel()})
     print(f"\n[INFO] グリッドポイント数: {len(df):,} 点")
+
+    # --- 出力形式のガイド（概算） & 選択（サンプリング前） ---
+    # 「x, y + ラスター列」を想定した列数でざっくり見積もり
+    est_cols = 2 + (len(rasters) if rasters else 0)
+    print_output_format_guide_from_shape(len(df), est_cols)
+
+    print("\n[出力形式の選択]")
+    print("  1) CSV（.csv）")
+    print("  2) Parquet（.parquet）")
+    print("  3) GeoPackage（.gpkg）")
+    fmt = input("保存形式を選んでください [1-3]（空=Parquet推奨）: ").strip()
+
+    if fmt == "1":
+        out_suffix = ".csv"
+    elif fmt == "3":
+        out_suffix = ".gpkg"
+    else:
+        out_suffix = ".parquet"
+
+    out_path = str(base_out_path.with_suffix(out_suffix))
 
     # --- ラスターサンプリング ---
     base_crs = None
@@ -1058,10 +1108,10 @@ def make_training_data_mode():
             print(f"  → ポリゴン属性を付与しました（列数: {len(attr_cols) if attr_cols else 0}）")
 
     # --- 出力 ---
-    # 行数・列数と概算メモリから、推奨される出力形式をガイド表示
+    # 最終テーブルのサイズ目安（実際の列数）を一度表示
     print_output_format_guide(df)
 
-    print("\n[出力]")  # out_path / out_suffix は関数冒頭で取得済み
+    print("\n[出力]")
     if out_suffix in [".parquet", ".pq"]:
         try:
             df.to_parquet(out_path, index=False)
@@ -1078,7 +1128,7 @@ def make_training_data_mode():
         else:
             def_str = "EPSG:4326"
         crs_epsg = ask_crs(default_epsg=def_str)
-        save_gpkg_with_points(df, out_path, x_col="x", y_col="y",
+        savels _gpkg_with_points(df, out_path, x_col="x", y_col="y",
                               crs_epsg=crs_epsg, layer_name="train")
         print(f"✅ GPKG を書き出しました: {out_path}")
     else:
