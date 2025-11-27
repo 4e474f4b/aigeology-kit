@@ -136,6 +136,12 @@ from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import LabelEncoder
 import joblib
 
+# XGBoost（GPU 学習用）はオプション依存
+try:
+    from xgboost import XGBClassifier
+except Exception:
+    XGBClassifier = None
+
 import matplotlib.pyplot as plt
 import geopandas as gpd
 
@@ -871,7 +877,7 @@ def make_training_data_mode():
             if not p_idx or p_idx.lower() in {"null", "none"}:
                 print("  ポリゴン属性は使用しません。")
             else:
-                m = re.fullmatch(r"[Pp](\\d+)", p_idx)
+                m = re.fullmatch(r"[Pp](\d+)", p_idx)
                 if m:
                     p_idx = m.group(1)
                 try:
@@ -1170,7 +1176,7 @@ def make_training_data_mode():
         else:
             def_str = "EPSG:4326"
         crs_epsg = ask_crs(default_epsg=def_str)
-        savels_gpkg_with_points(df, out_path, x_col="x", y_col="y",
+        save_gpkg_with_points(df, out_path, x_col="x", y_col="y",
                               crs_epsg=crs_epsg, layer_name="train")
         print(f"✅ GPKG を書き出しました: {out_path}")
     else:
@@ -1240,8 +1246,17 @@ def _alias_candidates(col: str):
 # 学習（train）
 # =========================================================
 
-def train_mode():
-    print("\n=== 学習モード（train） ===")
+def train_mode(backend: str = "rf"):
+    """
+    backend:
+      "rf"  -> scikit-learn RandomForest（CPU）
+      "xgb" -> XGBoost（GPU が利用可能なら GPU）
+    """
+    if backend == "xgb":
+        print("\n=== 学習モード（XGBoost / GPU） ===")
+    else:
+        backend = "rf"
+        print("\n=== 学習モード（RandomForest / CPU） ===")
     df, path = load_table_interactive()
 
     # デバッグ・軽量実験用のサンプル制限（任意）
@@ -1337,9 +1352,13 @@ def train_mode():
     use_stratify = ask_yes_no("層化サンプリング / 層化CV を使いますか？", default=True)
 
     # -------------------------------
-    # RandomForest パラメータ設定（共通）
+    # モデル別パラメータ設定
     # -------------------------------
-    print("\n[RandomForest パラメータ設定]")
+    if backend == "xgb":
+        print("\n[XGBoost パラメータ設定]")
+    else:
+        print("\n[RandomForest パラメータ設定]")
+
     n_estimators = input("n_estimators（木の本数, 空=200）: ").strip()
     if n_estimators:
         try:
@@ -1360,33 +1379,103 @@ def train_mode():
     else:
         max_depth = None
 
-    class_weight = None
-    if ask_yes_no("クラス不均衡対策として class_weight='balanced' を使いますか？", default=False):
-        class_weight = "balanced"
+    if backend == "xgb":
+        # XGBoost 用の追加パラメータ
+        lr_in = input("learning_rate（学習率, 空=0.1）: ").strip()
+        if lr_in:
+            try:
+                learning_rate = float(lr_in)
+            except ValueError:
+                print("  ⚠ float 変換に失敗したので 0.1 を使います。")
+                learning_rate = 0.1
+        else:
+            learning_rate = 0.1
 
-    rf = RandomForestClassifier(
-        n_estimators=n_estimators,
-        max_depth=max_depth,
-        random_state=random_state,
-        n_jobs=-1,
-        class_weight=class_weight,
-    )
+        subsample_in = input("subsample（サンプル行の割合, 空=0.8）: ").strip()
+        if subsample_in:
+            try:
+                subsample = float(subsample_in)
+            except ValueError:
+                print("  ⚠ float 変換に失敗したので 0.8 を使います。")
+                subsample = 0.8
+        else:
+            subsample = 0.8
 
-    pipe = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("rf", rf),
-    ])
+        colsample_in = input("colsample_bytree（サンプル特徴量の割合, 空=0.8）: ").strip()
+        if colsample_in:
+            try:
+                colsample_bytree = float(colsample_in)
+            except ValueError:
+                print("  ⚠ float 変換に失敗したので 0.8 を使います。")
+                colsample_bytree = 0.8
+        else:
+            colsample_bytree = 0.8
+
+        # XGBoost では class_weight は直接は使わないので None 固定
+        class_weight = None
+    else:
+        class_weight = None
+        if ask_yes_no("クラス不均衡対策として class_weight='balanced' を使いますか？", default=False):
+            class_weight = "balanced"
+
+    if backend == "xgb":
+        if XGBClassifier is None:
+            print("\n⚠ XGBoost（xgboost）がインポートできません。terrain-env で xgboost をインストールしてください。")
+            print("   例: mamba install -c conda-forge xgboost")
+            return
+
+        xgb_params = {
+            "n_estimators": n_estimators,
+            "max_depth": max_depth if max_depth is not None else 6,
+            "learning_rate": learning_rate,
+            "subsample": subsample,
+            "colsample_bytree": colsample_bytree,
+            "random_state": random_state,
+        }
+        try:
+            # xgboost >= 2 系（device 指定スタイル）
+            clf = XGBClassifier(
+                **xgb_params,
+                tree_method="hist",
+                device="cuda",
+            )
+        except TypeError:
+            # 旧バージョン向けフォールバック
+            clf = XGBClassifier(
+                **xgb_params,
+                tree_method="gpu_hist",
+                predictor="gpu_predictor",
+            )
+
+        pipe = Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("xgb", clf),
+        ])
+    else:
+        rf = RandomForestClassifier(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            random_state=random_state,
+            n_jobs=-1,
+            class_weight=class_weight,
+        )
+
+        pipe = Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("rf", rf),
+        ])
 
     # -------------------------------
     # 実験ID (run_id) と出力ディレクトリ
     # -------------------------------
     now = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_id = f"rf_{now}"
+    run_id_prefix = "xgb" if backend == "xgb" else "rf"
+    run_id = f"{run_id_prefix}_{now}"
     base = Path(path)
     out_dir = model_root / f"{base.stem}_{run_id}"
-    model_path = out_dir / f"rf_model_{run_id}.joblib"
-    meta_path  = out_dir / f"rf_meta_{run_id}.json"
-    imp_path   = out_dir / f"rf_feature_importance_{run_id}.csv"
+    model_path = out_dir / f"{run_id_prefix}_model_{run_id}.joblib"
+    meta_path  = out_dir / f"{run_id_prefix}_meta_{run_id}.json"
+    imp_path   = out_dir / f"{run_id_prefix}_feature_importance_{run_id}.csv"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # -------------------------------
@@ -1871,7 +1960,14 @@ def train_mode():
             test_size = 0.2
 
         if use_stratify:
-            stratify_arr = y
+            # 層化サンプリングが有効な場合のみ stratify を指定
+            # （クラスが1種類だけ、あるいは極端に少ないとエラーになるため）
+            unique, counts = np.unique(y, return_counts=True)
+            if len(unique) > 1 and np.all(counts >= 2):
+                stratify_arr = y
+            else:
+                print("  ⚠ クラス数が1つ、または極端に少ないため層化サンプリングは無効化します。")
+                stratify_arr = None
         else:
             stratify_arr = None
 
@@ -2012,11 +2108,19 @@ def train_mode():
 
     # モデル保存パラメータまとめ
     train_params = {
+        "backend": "xgb" if backend == "xgb" else "rf",
         "random_state": random_state,
         "n_estimators": n_estimators,
         "max_depth": max_depth,
-        "class_weight": class_weight,
     }
+    if backend == "xgb":
+        train_params.update({
+            "learning_rate": learning_rate,
+            "subsample": subsample,
+            "colsample_bytree": colsample_bytree,
+        })
+    else:
+        train_params["class_weight"] = class_weight
     # Monte Carlo も test_size を持つので、メタ情報に含める
     if eval_mode in ("holdout", "montecarlo"):
         train_params["test_size"] = test_size
@@ -2052,32 +2156,40 @@ def train_mode():
     print(f"[保存] 直近モデル: {latest_model}")
 
     # 特徴量重要度
-    rf_trained: RandomForestClassifier = pipe.named_steps["rf"]
-    importances = rf_trained.feature_importances_
-    imp_df = pd.DataFrame({
-        "feature": feature_cols,
-        "importance": importances,
-    }).sort_values("importance", ascending=False)
-    imp_df.to_csv(imp_path, index=False, encoding="utf-8")
-    print(f"[保存] 特徴量重要度 CSV: {imp_path}")
+    if backend == "xgb":
+        est = pipe.named_steps.get("xgb")
+        latest_imp = model_root / "xgb_feature_importance.csv"
+    else:
+        est = pipe.named_steps.get("rf")
+        latest_imp = model_root / "rf_feature_importance.csv"
 
-    # 特徴量重要度グラフ
-    topn = min(25, len(imp_df))
-    fig, ax = plt.subplots(figsize=(8, max(4, topn * 0.3)))
-    ax.barh(np.arange(topn), imp_df["importance"].values[:topn][::-1])
-    ax.set_yticks(np.arange(topn))
-    ax.set_yticklabels(imp_df["feature"].values[:topn][::-1])
-    ax.set_xlabel("Importance")
-    ax.set_title("Feature importance (top 25)")
-    plt.tight_layout()
-    fig_path = out_dir / f"rf_feature_importance_{run_id}.png"
-    fig.savefig(fig_path, dpi=150)
-    plt.close(fig)
-    print(f"[保存] 特徴量重要度 図: {fig_path}")
+    if est is not None and hasattr(est, "feature_importances_"):
+        importances = est.feature_importances_
+        imp_df = pd.DataFrame({
+            "feature": feature_cols,
+            "importance": importances,
+        }).sort_values("importance", ascending=False)
+        imp_df.to_csv(imp_path, index=False, encoding="utf-8")
+        print(f"[保存] 特徴量重要度 CSV: {imp_path}")
 
-    latest_imp = model_root / "rf_feature_importance.csv"
-    imp_df.to_csv(latest_imp, index=False, encoding="utf-8")
-    print(f"[保存] 直近特徴量重要度 CSV: {latest_imp}")
+        # 特徴量重要度グラフ
+        topn = min(25, len(imp_df))
+        fig, ax = plt.subplots(figsize=(8, max(4, topn * 0.3)))
+        ax.barh(np.arange(topn), imp_df["importance"].values[:topn][::-1])
+        ax.set_yticks(np.arange(topn))
+        ax.set_yticklabels(imp_df["feature"].values[:topn][::-1])
+        ax.set_xlabel("Importance")
+        ax.set_title("Feature importance (top 25)")
+        plt.tight_layout()
+        fig_path = out_dir / f"{run_id_prefix}_feature_importance_{run_id}.png"
+        fig.savefig(fig_path, dpi=150)
+        plt.close(fig)
+        print(f"[保存] 特徴量重要度 図: {fig_path}")
+
+        imp_df.to_csv(latest_imp, index=False, encoding="utf-8")
+        print(f"[保存] 直近特徴量重要度 CSV: {latest_imp}")
+    else:
+        print("\n[INFO] このモデルでは feature_importances_ が利用できないため、特徴量重要度の出力をスキップしました。")
 
     print("\n[完了] 学習モードが正常に終了しました。")
 
@@ -2684,16 +2796,22 @@ def predict_mode():
 def main():
     print("\n=== ランダムフォレスト（地形分類＋学習データ作成） ===")
     print("  1) 学習用データ作成（ラスター/ポリゴン → テーブル）")
-    print("  2) 学習（train）")
-    print("  3) 予測（predict）")
+    print("  2) 学習（RandomForest / CPU）")
+    print("  3) 学習（RandomForest：XGBoost / GPU）")
+    print("  4) 予測（学習済みモデルで予測：RF or XGBoost / CPU or GPU 自動）")
     print("  0) 終了")
-    choice = input("番号を選んでください [0-3]: ").strip() or "2"
+    choice = input("番号を選んでください [0-4]: ").strip() or "2"
 
     if choice == "1":
         make_training_data_mode()
     elif choice == "2":
-        train_mode()
+        # RandomForest（CPU）
+        train_mode(backend="rf")
     elif choice == "3":
+        # XGBoost（GPU）
+        train_mode(backend="xgb")
+    elif choice == "4":
+        # 予測は読み込むモデルに応じて CPU / GPU, RF / XGBoost が自動で切り替わる
         predict_mode()
     else:
         print("終了します。")
