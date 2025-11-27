@@ -788,15 +788,33 @@ def make_training_data_mode():
         return
 
     # --- 出力先の指定（ベースパスのみ先に聞いておく） ---
-    base_out = strip_quotes(input(
-        "学習用テーブルの出力ベースパス（拡張子なし。例: E:\\AiGeology\\train\\A-train）: "
-    ).strip())
-    if not base_out:
-        print("出力ベースパスが指定されていません。終了します。")
-        return
+    out_base_input = strip_quotes(
+        input(
+            "学習用テーブルの出力ベースパス（拡張子なし。例: E:\\AiGeology\\train\\A-train / 相対パス=特徴量ディレクトリ基準）: "
+        ).strip()
+    )
 
-    # 万一 .csv など拡張子付きで入力された場合は、拡張子を取り除いてベースパス扱いにする
-    base_out_path = Path(base_out)
+    if not out_base_input:
+        # 未指定なら特徴量ディレクトリ直下に自動生成
+        out_base = os.path.join(root_dir, "training_data")
+        print(f"[INFO] 出力ベースパス未指定のため、自動で設定しました: {out_base}")
+    else:
+        # 絶対パスかどうかで挙動を分ける
+        if os.path.isabs(out_base_input):
+            out_base = out_base_input
+        else:
+            # 相対パスの場合は特徴量ディレクトリ(root_dir) 基準で解釈
+            out_base = os.path.join(root_dir, out_base_input)
+
+    # Path 化（ここまでで out_base は絶対 or root_dir 基準になっている想定）
+    base_out_path = Path(out_base)
+
+    # 既存ディレクトリが指定された場合は、その中に同名ファイルを作成
+    if base_out_path.is_dir():
+        print(f"[INFO] 既存フォルダが指定されたため、その中に同名ファイルを作成します（{base_out_path.name}.*）。")
+        base_out_path = base_out_path / base_out_path.name
+
+    print(f"[INFO] 学習用テーブルの出力ベースパス: {base_out_path}")
     if base_out_path.suffix:
         print(f"[INFO] 拡張子 {base_out_path.suffix} は無視し、ベースパスとして扱います。")
         base_out_path = base_out_path.with_suffix("")
@@ -1038,6 +1056,11 @@ def make_training_data_mode():
     print("  3) GeoPackage（.gpkg）")
     fmt = input("保存形式を選んでください [1-3]（空=Parquet推奨）: ").strip()
 
+    # --- CRS の基準値（ラスター群があればその CRS を使用） ---
+    # 関数の早い段階で初期化しておくことで、
+    # 任意の分岐パスでも base_crs 未定義エラーを防ぐ
+    base_crs = None
+
     if fmt == "1":
         out_suffix = ".csv"
     elif fmt == "3":
@@ -1047,11 +1070,11 @@ def make_training_data_mode():
 
     out_path = str(base_out_path.with_suffix(out_suffix))
 
-    # --- ラスターサンプリング ---
-    base_crs = None
+    # --- ラスター読み込み準備 ---
     if rasters:
         try:
             import rasterio
+            from rasterio.transform import rowcol
         except Exception as e:
             print(f"⚠ rasterio がインポートできませんでした: {e}")
             print("   ラスターからのサンプリングはスキップします。")
@@ -1092,8 +1115,31 @@ def make_training_data_mode():
                 # -----------------------------
                 data = src.read()  # shape: (bands, height, width)
 
-                # rasterio は配列入力に対応しているので、一括で行・列 index を計算
-                rows, cols = src.index(x_arr, y_arr)
+                # rasterio.src.index に配列を渡せない環境でも動作するよう、
+                # アフィン変換パラメータから行・列をベクトル計算する
+                tf = src.transform
+                # 環境によって transform のイテレータ長が 6 超になる場合があるので、
+                # Affine の属性 or 先頭 6 要素だけを使うようにする
+                try:
+                    # Affine オブジェクトを想定
+                    a, b, c, d, e, f = tf.a, tf.b, tf.c, tf.d, tf.e, tf.f
+                except AttributeError:
+                    # tuple / list 等のときは先頭 6 要素のみを使用
+                    a, b, c, d, e, f = tf[:6]
+                if b == 0 and d == 0:
+                    # 一般的な north-up ラスター（回転なし）の場合は式で一括計算
+                    cols = ((x_arr - c) / a).astype("int64")
+                    rows = ((y_arr - f) / e).astype("int64")
+                else:
+                    # 回転成分を含む特殊なケースではフォールバックとして 1 点ずつ index を呼ぶ
+                    rows_list = []
+                    cols_list = []
+                    for xx, yy in zip(x_arr, y_arr):
+                        r, cidx = src.index(float(xx), float(yy))
+                        rows_list.append(r)
+                        cols_list.append(cidx)
+                    rows = np.array(rows_list, dtype="int64")
+                    cols = np.array(cols_list, dtype="int64")
 
                 # 範囲外 (out-of-bounds) は NaN にしたいのでまずマスクを作る
                 mask_oob = (
@@ -1116,7 +1162,7 @@ def make_training_data_mode():
                 if mask_oob.any():
                     vals[mask_oob, :] = np.nan
 
-                # nodata → NaN に置き換え
+                # nodata → NaN に置き換え（この時点で配列側に反映しておく）
                 nodata = src.nodata
                 if nodata is not None:
                     vals = np.where(vals == nodata, np.nan, vals)
@@ -1148,10 +1194,17 @@ def make_training_data_mode():
         from shapely.geometry import Point as ShapelyPoint
 
         poly_gdf = gpd.read_file(poly_for_attr)
-        if poly_gdf.crs is None:
-            poly_gdf.set_crs(base_crs, inplace=True)
-        elif poly_gdf.crs != base_crs:
-            poly_gdf = poly_gdf.to_crs(base_crs)
+
+        # --- CRS の合わせ込み ---
+        # ラスターが 1 枚以上あれば base_crs に揃える。
+        # ラスターが無い場合は、ポリゴン側の CRS を基準にする。
+        if base_crs is None:
+            base_crs = poly_gdf.crs
+        else:
+            if poly_gdf.crs is None:
+                poly_gdf.set_crs(base_crs, inplace=True)
+            elif poly_gdf.crs != base_crs:
+                poly_gdf = poly_gdf.to_crs(base_crs)
 
         # 利用する属性列（事前に選択された列を優先）
         attr_candidates = [c for c in poly_gdf.columns if c.lower() not in {"geometry"}]
@@ -1185,8 +1238,10 @@ def make_training_data_mode():
             joined = joined.drop(columns=drop_cols)
             if "geometry" in joined.columns:
                 joined = joined.drop(columns=["geometry"])
-            df = joined.reset_index(drop=True)
-            print(f"  → ポリゴン属性を付与しました（列数: {len(attr_cols)}）")
+        # 元の特徴量テーブル df（x, y + ラスター特徴量）に
+        # ポリゴン属性をマージする（x, y はグリッドで一意）
+        df = df.merge(joined, on=["x", "y"], how="left")
+        print(f"  → ポリゴン属性を付与しました（列数: {len(attr_cols)}）")
 
     # --- 出力 ---
     print("\n[出力]")
@@ -1441,12 +1496,10 @@ def train_mode(backend: str = "rf"):
         else:
             colsample_bytree = 0.8
 
-        # XGBoost では class_weight は直接は使わないので None 固定
+        # class_weight は XGBoost では直接利用せず、
+        # RandomForest 側でも「balanced」指定は行わずに None 固定とする
+        # （クラス不均衡への対応は、今後サンプリング設計などで統一的に扱う前提）
         class_weight = None
-    else:
-        class_weight = None
-        if ask_yes_no("クラス不均衡対策として class_weight='balanced' を使いますか？", default=False):
-            class_weight = "balanced"
 
     if backend == "xgb":
         if XGBClassifier is None:
