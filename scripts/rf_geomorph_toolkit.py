@@ -1057,8 +1057,11 @@ def make_training_data_mode():
             print("   ラスターからのサンプリングはスキップします。")
             rasters = []
 
-    # すべてのラスターで共通に使う座標リスト（事前に1回だけ作成）
-    coords = list(zip(df["x"].values, df["y"].values))
+    # すべてのラスターで共通に使うグリッド座標（ndarray）
+    # → rasterio.sample(coords) は Python ループ＋I/O が重いので使わず、
+    #    x,y → row,col を一括で求めて配列から直接取り出す方式にする
+    x_arr = df["x"].to_numpy()
+    y_arr = df["y"].to_numpy()
 
     # ここに「列名 → 値配列」を貯めて、最後に一括で df に結合する
     cols_dict = {}
@@ -1081,12 +1084,39 @@ def make_training_data_mode():
                             f"CRS が一致しません: {r_path} ({src.crs}) != {base_crs}"
                         )
 
-                # サンプリングして ndarray 化
-                vals = np.array(list(src.sample(coords)))
-                if vals.ndim == 1:
-                    vals = vals.reshape(-1, 1)
+                # -----------------------------
+                # 高速サンプリング：
+                #   1) ラスターを一括で配列に読み込み
+                #   2) x,y → row,col をベクトルで算出
+                #   3) data[:, row, col] からまとめて抽出
+                # -----------------------------
+                data = src.read()  # shape: (bands, height, width)
 
-                # nodata → NaN に置き換え（この時点で配列側に反映しておく）
+                # rasterio は配列入力に対応しているので、一括で行・列 index を計算
+                rows, cols = src.index(x_arr, y_arr)
+
+                # 範囲外 (out-of-bounds) は NaN にしたいのでまずマスクを作る
+                mask_oob = (
+                    (rows < 0)
+                    | (rows >= src.height)
+                    | (cols < 0)
+                    | (cols >= src.width)
+                )
+
+                # index エラー防止のため、範囲外は一旦 (0,0) に退避
+                rows_safe = rows.copy()
+                cols_safe = cols.copy()
+                rows_safe[mask_oob] = 0
+                cols_safe[mask_oob] = 0
+
+                # data[:, rows, cols] → shape: (bands, N) なので転置して (N, bands) に
+                vals = data[:, rows_safe, cols_safe].transpose(1, 0)
+
+                # 範囲外は NaN 扱い
+                if mask_oob.any():
+                    vals[mask_oob, :] = np.nan
+
+                # nodata → NaN に置き換え
                 nodata = src.nodata
                 if nodata is not None:
                     vals = np.where(vals == nodata, np.nan, vals)
