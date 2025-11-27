@@ -2754,6 +2754,44 @@ def predict_mode():
                 print(f"  ⚠ 評価結果の保存に失敗しました: {e}")
 
     # =====================================================
+    # 誤分類点のみの GPKG 出力（predict 実行時）
+    #   ※ 入力テーブルに正解ラベルが含まれている場合のみ有効
+    # =====================================================
+    try:
+        if target_col in df.columns:
+            # true/pred ラベルと is_correct を持つ DataFrame を構築
+            eval_df = out.copy()
+            eval_df["true_label"] = df[target_col]
+            eval_df["is_correct"] = (
+                eval_df["true_label"].astype(str)
+                == eval_df["y_pred"].astype(str)
+            )
+
+            errors_df = eval_df[~eval_df["is_correct"]].copy()
+            if not errors_df.empty:
+                print("\n[オプション] 誤分類点のみの GPKG を出力します。")
+                # x,y 列は自動検出＋対話式選択
+                x_col, y_col = ensure_xy_columns(errors_df)
+                default_crs = source_crs_str or "EPSG:4326"
+                crs_epsg = ask_crs(default_epsg=default_crs)
+                errors_gpkg_path = (
+                    out_dir / f"{Path(base_out).name}_eval_predict_errors_{run_id}.gpkg"
+                )
+                save_gpkg_with_points(
+                    errors_df,
+                    errors_gpkg_path,
+                    x_col=x_col,
+                    y_col=y_col,
+                    crs_epsg=crs_epsg,
+                    layer_name="eval_predict_errors",
+                )
+                print(f"  → 誤分類点 GPKG を保存しました: {errors_gpkg_path}")
+            else:
+                print("\n[INFO] 誤分類点が存在しないため、誤分類 GPKG の出力はスキップします。")
+    except Exception as e:
+        print(f"  ⚠ 誤分類 GPKG の保存に失敗しました: {e}")
+
+    # =====================================================
     # 予測クラスの件数サマリ（常に出力）
     # =====================================================
     try:
@@ -2787,10 +2825,20 @@ def predict_mode():
 
     # =====================================================
     # 特徴量重要度（predict 実行時にも出力: train と書式を揃える）
+    #   ※ backend が RF でも XGBoost でも動くように、パイプライン内の
+    #      ステップから自動でモデルを検出する
     # =====================================================
     try:
-        rf_trained: RandomForestClassifier = pipe.named_steps["rf"]
-        importances = rf_trained.feature_importances_
+        model_step = None
+        for key in ("rf", "xgb"):
+            if key in pipe.named_steps:
+                model_step = pipe.named_steps[key]
+                break
+
+        if model_step is None:
+            raise KeyError("rf / xgb step not found in pipeline")
+
+        importances = model_step.feature_importances_
         imp_df = pd.DataFrame(
             {
                 "feature": feature_cols,
@@ -2798,6 +2846,7 @@ def predict_mode():
             }
         ).sort_values("importance", ascending=False)
 
+        # ファイル名は従来どおり rf_ プレフィックスで互換性を維持
         imp_path = out_dir / f"rf_feature_importance_{run_id}.csv"
         imp_df.to_csv(imp_path, index=False, encoding="utf-8")
         print(f"[保存] 特徴量重要度 CSV（predict）: {imp_path}")
