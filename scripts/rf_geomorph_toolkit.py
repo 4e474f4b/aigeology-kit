@@ -2754,42 +2754,49 @@ def predict_mode():
                 print(f"  ⚠ 評価結果の保存に失敗しました: {e}")
 
     # =====================================================
-    # 誤分類点のみの GPKG 出力（predict 実行時）
-    #   ※ 入力テーブルに正解ラベルが含まれている場合のみ有効
+    # 予測結果の GPKG 出力（predict 実行時）
+    #   ※ 正解ラベルの有無にかかわらず全件を出力
+    #   ※ 正解ラベルがある場合は true_label / is_correct を付与
     # =====================================================
     try:
+        # ベースとなる DataFrame（全行）
         if target_col in df.columns:
-            # true/pred ラベルと is_correct を持つ DataFrame を構築
             eval_df = out.copy()
             eval_df["true_label"] = df[target_col]
             eval_df["is_correct"] = (
                 eval_df["true_label"].astype(str)
                 == eval_df["y_pred"].astype(str)
             )
+            gpkg_df = eval_df
+            layer_name = "eval_predict"
+            suffix = "eval_predict_all"
+        else:
+            gpkg_df = out.copy()
+            layer_name = "pred"
+            suffix = "pred_all"
 
-            errors_df = eval_df[~eval_df["is_correct"]].copy()
-            if not errors_df.empty:
-                print("\n[オプション] 誤分類点のみの GPKG を出力します。")
-                # x,y 列は自動検出＋対話式選択
-                x_col, y_col = ensure_xy_columns(errors_df)
-                default_crs = source_crs_str or "EPSG:4326"
-                crs_epsg = ask_crs(default_epsg=default_crs)
-                errors_gpkg_path = (
-                    out_dir / f"{Path(base_out).name}_eval_predict_errors_{run_id}.gpkg"
-                )
-                save_gpkg_with_points(
-                    errors_df,
-                    errors_gpkg_path,
-                    x_col=x_col,
-                    y_col=y_col,
-                    crs_epsg=crs_epsg,
-                    layer_name="eval_predict_errors",
-                )
-                print(f"  → 誤分類点 GPKG を保存しました: {errors_gpkg_path}")
-            else:
-                print("\n[INFO] 誤分類点が存在しないため、誤分類 GPKG の出力はスキップします。")
+        if gpkg_df.empty:
+            print("\n[INFO] 予測結果が空のため、GPKG の出力はスキップします。")
+        else:
+            print("\n[オプション] 予測結果（全件）を GPKG として出力します。")
+            # x,y 列は自動検出＋対話式選択
+            x_col, y_col = ensure_xy_columns(gpkg_df)
+            default_crs = source_crs_str or "EPSG:4326"
+            crs_epsg = ask_crs(default_epsg=default_crs)
+            gpkg_path = (
+                out_dir / f"{Path(base_out).name}_{suffix}_{run_id}.gpkg"
+            )
+            save_gpkg_with_points(
+                gpkg_df,
+                gpkg_path,
+                x_col=x_col,
+                y_col=y_col,
+                crs_epsg=crs_epsg,
+                layer_name=layer_name,
+            )
+            print(f"  → 予測結果 GPKG を保存しました: {gpkg_path}")
     except Exception as e:
-        print(f"  ⚠ 誤分類 GPKG の保存に失敗しました: {e}")
+        print(f"  ⚠ 予測結果 GPKG の保存に失敗しました: {e}")
 
     # =====================================================
     # 予測クラスの件数サマリ（常に出力）
