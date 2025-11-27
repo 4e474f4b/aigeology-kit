@@ -44,7 +44,44 @@ import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point, Polygon
 
-from sklearn.neighbors import NearestNeighbors
+from sklearn.neighbors import NearestNeighbors as SklearnNearestNeighbors
+
+# GPU (cuML) が使える環境では、POINTGRID_USE_GPU=1 のときに GPU バックエンドを利用する
+try:
+    from cuml.neighbors import NearestNeighbors as CuMLNearestNeighbors  # type: ignore
+    _HAS_CUML = True
+except Exception:
+    CuMLNearestNeighbors = None  # type: ignore
+    _HAS_CUML = False
+
+# 環境変数 POINTGRID_USE_GPU が 1 / true / yes / y なら GPU バックエンドを優先
+USE_GPU_NEIGHBORS = os.environ.get("POINTGRID_USE_GPU", "").lower() in ("1", "true", "yes", "y")
+
+# メモリ安全対策用のしきい値
+MAX_WARN_CELLS  = 1_000_000   # ここを超えたら強めの警告
+MAX_ABORT_CELLS = 5_000_000   # ここを超えたら問答無用で中止
+NN_BATCH_SIZE   = 200_000     # 近傍探索時に処理するセル中心のバッチサイズ
+
+
+def make_nearest_neighbors(
+    n_neighbors: Optional[int] = None,
+    radius: Optional[float] = None,
+):
+    """
+    近傍探索オブジェクトを生成するヘルパー。
+    - GPU (cuML) が利用可能かつ USE_GPU_NEIGHBORS=True なら cuML を使用
+    - それ以外は scikit-learn を使用
+    """
+    use_gpu = USE_GPU_NEIGHBORS and _HAS_CUML
+    if use_gpu:
+        nn_cls = CuMLNearestNeighbors
+    else:
+        nn_cls = SklearnNearestNeighbors
+
+    if n_neighbors is not None:
+        return nn_cls(n_neighbors=n_neighbors)
+    else:
+        return nn_cls(radius=radius)
 
 
 # ============================================================
@@ -143,14 +180,19 @@ def build_fishnet(bounds: Tuple[float, float, float, float],
 
     print(f"\n[INFO] グリッド数の見込み: {nx} 列 × {ny} 行 = {n_cells} セル")
 
-    if n_cells > 500_000:
-        cont = ask_yes_no(
-            "[注意] セル数が 50 万を超えます。処理時間・メモリ使用量が大きくなりますが続行しますか？ [y/N]:",
-            default="n",
+    # セル数が大きすぎる場合の安全対策
+    if n_cells > MAX_ABORT_CELLS:
+        print(
+            f"[ERROR] セル数が {MAX_ABORT_CELLS:,} を超えています（推定 {n_cells:,} セル）。\n"
+            "       5百万セルを超えたので処理中止します。処理データの大きさを再検討して、\n"
+            "       セルサイズを粗くするか、処理領域を分割してから再実行してください。"
         )
-        if not cont:
-            print("[INFO] ユーザー操作により中断しました。")
-            sys.exit(0)
+        sys.exit(1)
+    elif n_cells > MAX_WARN_CELLS:
+        print(
+            f"[WARN] セル数が {MAX_WARN_CELLS:,} を超えています（推定 {n_cells:,} セル）。\n"
+            "       処理時間・メモリ使用量がかなり大きくなる可能性があります。"
+        )
 
     polygons: List[Polygon] = []
     centers_x: List[float] = []
@@ -233,16 +275,39 @@ def assign_classes_A_nearest(
         sys.exit(1)
 
     # セル中心座標
-    centers_xy = np.vstack([grid_gdf["center_x"].values, grid_gdf["center_y"].values]).T
+    centers_xy = np.vstack(
+        [grid_gdf["center_x"].values, grid_gdf["center_y"].values]
+    ).T
 
-    print("[INFO] 最近傍探索用のインデックスを構築中（scikit-learn NearestNeighbors）...")
-    nn = NearestNeighbors(n_neighbors=1, algorithm="auto")
+    print("[INFO] 最近傍探索用のインデックスを構築中（NearestNeighbors バックエンド）...")
+    nn = make_nearest_neighbors(n_neighbors=1)
     nn.fit(pts_xy)
 
-    print("[INFO] 全セル中心に対して最近傍点を検索中...")
-    distances, indices = nn.kneighbors(centers_xy, return_distance=True)
-    nearest_idx = indices[:, 0]
-    nearest_dist = distances[:, 0]
+    print("[INFO] 全セル中心に対して最近傍点を検索中（バッチ処理）...")
+
+    n_cells = centers_xy.shape[0]
+    batch_size = NN_BATCH_SIZE
+
+    # 結果格納用（事前に配列を確保）
+    nearest_idx = np.empty(n_cells, dtype=int)
+    nearest_dist = np.empty(n_cells, dtype=float)
+
+    start = 0
+    while start < n_cells:
+        end = min(start + batch_size, n_cells)
+        centers_batch = centers_xy[start:end]
+
+        distances, indices = nn.kneighbors(centers_batch, return_distance=True)
+        distances = distances[:, 0]
+        indices = indices[:, 0]
+
+        nearest_dist[start:end] = distances
+        nearest_idx[start:end] = indices
+
+        print(f"[INFO] 最近傍探索: {end:,} / {n_cells:,} セルまで処理完了...", end="\r")
+        start = end
+
+    print(f"\n[INFO] 最近傍探索が完了しました（{n_cells:,} セル）。")
 
     # クラス割り当て
     grid_gdf = grid_gdf.copy()
@@ -268,42 +333,55 @@ def assign_classes_B_radius_majority(
     print("\n[INFO] B方式：半径内多数決でクラスを割り当てます（Kernel Majority）。")
     print(f"[INFO] 使用する半径: {radius} (座標系の単位)")
 
-    pts_xy = np.vstack([points_gdf.geometry.x.values, points_gdf.geometry.y.values]).T
+    pts_xy = np.vstack(
+        [points_gdf.geometry.x.values, points_gdf.geometry.y.values]
+    ).T
     pts_class = points_gdf[class_col].values
 
     if len(pts_xy) == 0:
         print("[ERROR] 点が1つも存在しません。")
         sys.exit(1)
 
-    centers_xy = np.vstack([grid_gdf["center_x"].values, grid_gdf["center_y"].values]).T
+    centers_xy = np.vstack(
+        [grid_gdf["center_x"].values, grid_gdf["center_y"].values]
+    ).T
+    n_cells = centers_xy.shape[0]
 
-    print("[INFO] 半径近傍探索用のインデックスを構築中（scikit-learn NearestNeighbors）...")
-    nn = NearestNeighbors(radius=radius, algorithm="auto")
+    print("[INFO] 半径近傍探索用のインデックスを構築中（NearestNeighbors バックエンド）...")
+    nn = make_nearest_neighbors(radius=radius)
     nn.fit(pts_xy)
 
-    print("[INFO] 全セル中心に対して半径内の近傍点を検索中...")
-    distances_list, indices_list = nn.radius_neighbors(
-        centers_xy, radius=radius, return_distance=True
-    )
-
     # 結果格納用
-    assigned_class = []
-    n_points_list = []
+    assigned_class: List[object] = []
+    n_points_list: List[int] = []
 
-    for idxs in indices_list:
-        if len(idxs) == 0:
-            assigned_class.append(np.nan)
-            n_points_list.append(0)
-        else:
+    print("[INFO] 全セル中心に対して半径内の近傍点を検索中（バッチ処理）...")
+    batch_size = NN_BATCH_SIZE
+    start = 0
+    while start < n_cells:
+        end = min(start + batch_size, n_cells)
+        centers_batch = centers_xy[start:end]
+
+        distances_list, indices_list = nn.radius_neighbors(
+            centers_batch, radius=radius, return_distance=True
+        )
+
+        for dists, idxs in zip(distances_list, indices_list):
+            idxs = np.asarray(idxs, dtype=int)
+            if idxs.size == 0:
+                assigned_class.append(np.nan)
+                n_points_list.append(0)
+                continue
+
             cls_raw = pts_class[idxs]
             # None / NaN を除外
             cls_clean = [
-                c for c in cls_raw
+                c
+                for c in cls_raw
                 if (c is not None) and not (isinstance(c, float) and np.isnan(c))
             ]
 
             if len(cls_clean) == 0:
-                # 有効なクラスが1つも無ければ「未分類セル」とする
                 assigned_class.append(np.nan)
                 n_points_list.append(0)
                 continue
@@ -313,6 +391,11 @@ def assign_classes_B_radius_majority(
             majority_class = values[np.argmax(counts)]
             assigned_class.append(majority_class)
             n_points_list.append(len(cls_clean))
+
+        print(f"[INFO] 半径内探索: {end:,} / {n_cells:,} セルまで処理完了...", end="\r")
+        start = end
+
+    print(f"\n[INFO] 半径内探索が完了しました（{n_cells:,} セル）。")
 
     grid_gdf = grid_gdf.copy()
     grid_gdf[class_col] = assigned_class
@@ -343,52 +426,81 @@ def assign_classes_C_weighted_majority(
     print(f"[INFO] 使用する半径: {radius} (座標系の単位)")
     print(f"[INFO] 距離減衰の指数 power: {power}, eps: {eps}")
 
-    pts_xy = np.vstack([points_gdf.geometry.x.values, points_gdf.geometry.y.values]).T
+    pts_xy = np.vstack(
+        [points_gdf.geometry.x.values, points_gdf.geometry.y.values]
+    ).T
     pts_class = points_gdf[class_col].values
 
     if len(pts_xy) == 0:
         print("[ERROR] 点が1つも存在しません。")
         sys.exit(1)
 
-    centers_xy = np.vstack([grid_gdf["center_x"].values, grid_gdf["center_y"].values]).T
+    centers_xy = np.vstack(
+        [grid_gdf["center_x"].values, grid_gdf["center_y"].values]
+    ).T
+    n_cells = centers_xy.shape[0]
 
-    print("[INFO] 半径近傍探索用のインデックスを構築中（scikit-learn NearestNeighbors）...")
-    nn = NearestNeighbors(radius=radius, algorithm="auto")
+    print("[INFO] 半径近傍探索用のインデックスを構築中（NearestNeighbors バックエンド）...")
+    nn = make_nearest_neighbors(radius=radius)
     nn.fit(pts_xy)
 
-    print("[INFO] 全セル中心に対して半径内の近傍点を検索中（距離も取得）...")
-    distances_list, indices_list = nn.radius_neighbors(
-        centers_xy, radius=radius, return_distance=True
-    )
+    assigned_class: List[object] = []
+    n_points_list: List[int] = []
+    class_conf_list: List[float] = []  # もっとも重みが大きいクラスの重み割合
 
-    assigned_class = []
-    n_points_list = []
-    class_conf_list = []  # もっとも重みが大きいクラスの重み割合
+    print("[INFO] 全セル中心に対して半径内の近傍点を検索中（バッチ処理＋距離取得）...")
+    batch_size = NN_BATCH_SIZE
+    start = 0
+    while start < n_cells:
+        end = min(start + batch_size, n_cells)
+        centers_batch = centers_xy[start:end]
 
-    for dists, idxs in zip(distances_list, indices_list):
-        if len(idxs) == 0:
-            assigned_class.append(np.nan)
-            n_points_list.append(0)
-            class_conf_list.append(np.nan)
-        else:
-            cls = pts_class[idxs]
-            # 重み計算
-            # d=0 の場合もあるので eps を足しておく
+        distances_list, indices_list = nn.radius_neighbors(
+            centers_batch, radius=radius, return_distance=True
+        )
+
+        for dists, idxs in zip(distances_list, indices_list):
+            idxs = np.asarray(idxs, dtype=int)
+            if idxs.size == 0:
+                assigned_class.append(np.nan)
+                n_points_list.append(0)
+                class_conf_list.append(np.nan)
+                continue
+
+            dists = np.asarray(dists, dtype=float)
+
+            # 重み計算（d=0 の場合もあるので eps を足しておく）
             weights = 1.0 / (np.power(dists, power) + eps)
 
-            # クラスごとに重みを集計
+            # クラスごとに重みを集計（None / NaN は除外）
+            cls = pts_class[idxs]
             weight_by_class: Dict[object, float] = {}
             for c, w in zip(cls, weights):
+                if c is None or (isinstance(c, float) and np.isnan(c)):
+                    continue
                 weight_by_class[c] = weight_by_class.get(c, 0.0) + w
 
+            if not weight_by_class:
+                assigned_class.append(np.nan)
+                n_points_list.append(0)
+                class_conf_list.append(np.nan)
+                continue
+
             # 最大重みのクラス
-            major_class = max(weight_by_class.items(), key=lambda kv: kv[1])[0]
-            total_w = sum(weight_by_class.values())
-            conf = weight_by_class[major_class] / total_w if total_w > 0 else np.nan
+            major_class, major_weight = max(
+                weight_by_class.items(), key=lambda kv: kv[1]
+            )
+            total_weight = sum(weight_by_class.values())
+            conf = major_weight / total_weight if total_weight > 0 else np.nan
 
             assigned_class.append(major_class)
-            n_points_list.append(len(cls))
-            class_conf_list.append(conf)
+            n_points_list.append(int(len(cls)))
+            class_conf_list.append(float(conf))
+
+        print(f"[INFO] 半径内探索（重み付き）: {end:,} / {n_cells:,} セルまで処理完了...", end="\r")
+        start = end
+
+    print(f"\n[INFO] 半径内探索（重み付き）が完了しました（{n_cells:,} セル）。")
 
     grid_gdf = grid_gdf.copy()
     grid_gdf[class_col] = assigned_class
@@ -442,6 +554,15 @@ def dissolve_by_class(grid_gdf: gpd.GeoDataFrame, class_col: str) -> gpd.GeoData
 
 def main():
     print_header()
+
+    # 近傍探索のバックエンド情報を表示
+    if USE_GPU_NEIGHBORS and _HAS_CUML:
+        print("[INFO] 近傍探索バックエンド: GPU (cuML, POINTGRID_USE_GPU=1)")
+    elif USE_GPU_NEIGHBORS and not _HAS_CUML:
+        print("[WARN] POINTGRID_USE_GPU が指定されていますが、cuML が見つかりません。CPU (scikit-learn) を使用します。")
+    else:
+        print("[INFO] 近傍探索バックエンド: CPU (scikit-learn)")
+    print()
 
     # ----------------------------------------
     # 1. 入力ファイル
