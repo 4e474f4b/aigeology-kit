@@ -74,12 +74,71 @@ def ask_output_format() -> tuple[str, str]:
             print("[ERROR] 1〜3 を入力してください。")
 
 
-def main():
-    print("=== BBOX CSV → ポリゴン (GPKG / GeoJSON 他) 変換スクリプト ===\n")
+def ask_bbox_rows() -> pd.DataFrame:
+    """
+    手入力で BBOX 情報を複数件入力して DataFrame にまとめる。
+    列構成は CSV と同じく name, Xmin, Ymin, Xmax, Ymax。
+    """
+    print("\n[手入力モード] BBOX を1件ずつ入力します。")
+    print("  空の name を入力すると終了します。")
 
-    # 1) 入力CSV
-    csv_path = ask_path('BBOX テキスト（CSV）のパスを入力してください（ドラッグ&ドロップ可）: ')
-    print(f"[INFO] 入力CSV: {csv_path}")
+    rows: list[dict] = []
+
+    def _ask_float(label: str) -> float:
+        while True:
+            s = input(f"  {label}: ").strip()
+            try:
+                return float(s)
+            except ValueError:
+                print("[ERROR] 数値を入力してください。")
+
+    while True:
+        name = input("\nname（空Enterで終了）: ").strip()
+        if not name:
+            break
+        xmin = _ask_float("Xmin")
+        ymin = _ask_float("Ymin")
+        xmax = _ask_float("Xmax")
+        ymax = _ask_float("Ymax")
+        rows.append(
+            {
+                "name": name,
+                "Xmin": xmin,
+                "Ymin": ymin,
+                "Xmax": xmax,
+                "Ymax": ymax,
+            }
+        )
+
+    if not rows:
+        print("[ERROR] 1件も入力されませんでした。")
+        # 後続で empty 判定できるよう、正しい列名だけ持つ空 DataFrame を返す
+        return pd.DataFrame(columns=["name", "Xmin", "Ymin", "Xmax", "Ymax"])
+
+    return pd.DataFrame(rows)
+
+
+def main():
+    print("=== BBOX CSV → ポリゴン (GPKG / GeoJSON 他) 変換スクリプト ===")
+    print("\n[期待するCSV形式]")
+    print("  name,Xmin,Ymin,Xmax,Ymax")
+    print("  A,20400,-114850,21400,-114750")
+    print("  B,22150,-116000,23150,-115000\n")
+
+    # 1) 入力方法の選択
+    print("入力方法を選択してください:")
+    print("  1) CSV ファイルから読み込む")
+    print("  2) 手入力で BBOX を指定する")
+    mode = input("番号を入力 [1-2]（空Enterで 1 = CSV）: ").strip()
+    use_csv = mode != "2"
+
+    csv_path = None
+    if use_csv:
+        # CSV ファイルパス
+        csv_path = ask_path('BBOX テキスト（CSV）のパスを入力してください（ドラッグ&ドロップ可）: ')
+        print(f"[INFO] 入力CSV: {csv_path}")
+    else:
+        print("[INFO] 手入力モードを選択しました。")
 
     # 2) 座標系 EPSG
     crs = ask_epsg(default=6673)
@@ -89,10 +148,14 @@ def main():
     driver, ext = ask_output_format()
     print(f"[INFO] 出力形式: {driver}")
 
-    # 4) 出力パス
-    default_out = csv_path.with_suffix("")  # 拡張子なし
-    default_out = default_out.with_name(default_out.name + "_bbox")  # xxx_bbox
-    default_out = default_out.with_suffix(ext)
+    # 4) 出力パス（デフォルト）
+    if use_csv and csv_path is not None:
+        default_out = csv_path.with_suffix("")  # 拡張子なし
+        default_out = default_out.with_name(default_out.name + "_bbox")  # xxx_bbox
+        default_out = default_out.with_suffix(ext)
+    else:
+        # 手入力モード時のデフォルト出力先（カレントディレクトリ）
+        default_out = (Path.cwd() / "bbox_manual").with_suffix(ext)
     out_str = input(f"\n出力ファイルパスを入力してください\n"
                     f"(空Enterで既定: {default_out}): ").strip()
     if not out_str:
@@ -106,13 +169,20 @@ def main():
 
     print(f"[INFO] 出力ファイル: {out_path}\n")
 
-    # 5) CSV 読み込み
-    #   日本語ヘッダ/ BOM を考慮して encoding だけ少し丁寧に
-    try:
-        df = pd.read_csv(csv_path, encoding="utf-8-sig")
-    except Exception as e:
-        print(f"[ERROR] CSV 読み込みに失敗しました: {e}")
-        return
+    # 5) 入力データの取得
+    if use_csv and csv_path is not None:
+        # CSV 読み込み（日本語ヘッダ / BOM を考慮）
+        try:
+            df = pd.read_csv(csv_path, encoding="utf-8-sig")
+        except Exception as e:
+            print(f"[ERROR] CSV 読み込みに失敗しました: {e}")
+            return
+    else:
+        # 手入力で DataFrame を作成
+        df = ask_bbox_rows()
+        if df.empty:
+            print("[ERROR] 有効な BBOX が 1 件も入力されませんでした。処理を終了します。")
+            return
 
     required_cols = ["name", "Xmin", "Ymin", "Xmax", "Ymax"]
     for col in required_cols:
