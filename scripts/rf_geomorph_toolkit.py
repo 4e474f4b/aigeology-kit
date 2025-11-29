@@ -126,13 +126,18 @@ from sklearn.model_selection import (
     cross_validate,
     cross_val_predict,
 )
+from sklearn.base import clone
 from sklearn.metrics import (
     confusion_matrix,
     classification_report,
+    accuracy_score,
+    f1_score,
+    log_loss,
 )
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
+from sklearn.base import clone
 from sklearn.preprocessing import LabelEncoder
 import joblib
 
@@ -332,11 +337,206 @@ def _plot_confusion_matrix(cm, labels, normalize=False,
             )
 
     fig.tight_layout()
-    if save_path is not None:
+
+    if save_path:
         fig.savefig(save_path, dpi=150)
-        print(f"[保存] 混同行列 図: {save_path}")
+
+        # 追加: 図の元データ（cm_plot）を CSV でも保存
+        try:
+            import pandas as pd
+            from pathlib import Path
+
+            csv_path = Path(save_path).with_suffix(".csv")
+            df_cm = pd.DataFrame(cm_plot, index=labels, columns=labels)
+            df_cm.to_csv(csv_path, encoding="utf-8-sig")
+            print(f"[保存] 混同行列データ CSV: {csv_path}")
+        except Exception as e:
+            print(f"[WARN] 混同行列データ CSV の保存に失敗しました: {e}")
+
+        plt.close(fig)
+
+    print(f"[INFO] 混同行列を保存しました: {save_path}")
+
+
+def _plot_learning_curve(
+    estimator,
+    X,
+    y,
+    cv,
+    out_dir,
+    run_id_prefix,
+    run_id,
+    eval_mode,
+):
+    """
+    n_estimators を横軸にした学習曲線を描画する。
+
+    - 上段: 検証 log loss（メイン指標）
+    - 下段: 検証 Accuracy / Macro-F1
+    """
+    if cv is None:
+        print("[INFO] 学習曲線用の CV が指定されていないためスキップします。")
+        return
+
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    # X, y を numpy 配列にそろえる
+    X = np.asarray(X)
+    y = np.asarray(y)
+
+    # estimator は Pipeline を想定（'imputer' + 'rf' or 'xgb'）
+    if not hasattr(estimator, "named_steps"):
+        print("[WARN] estimator が Pipeline ではないため学習曲線をスキップします。")
+        return
+
+    steps = estimator.named_steps
+    imputer = steps.get("imputer", None)
+
+    clf_name = None
+    for name in ("rf", "xgb", "clf"):
+        if name in steps:
+            clf_name = name
+            break
+
+    if clf_name is None:
+        print("[WARN] Pipeline に分類器ステップが見つからないため学習曲線をスキップします。")
+        return
+
+    base_clf = steps[clf_name]
+    if not hasattr(base_clf, "n_estimators"):
+        print("[WARN] 分類器が n_estimators を持っていないため学習曲線をスキップします。")
+        return
+
+    base_n = int(getattr(base_clf, "n_estimators", 0))
+    if base_n <= 1:
+        print("[INFO] n_estimators が 1 以下のため学習曲線をスキップします。")
+        return
+
+    # 評価する n_estimators のリスト（例: 200 → 20,40,...,200）
+    num_points = min(10, base_n)
+    est_list = np.linspace(
+        max(1, base_n // num_points),
+        base_n,
+        num=num_points,
+        dtype=int,
+    )
+    est_list = sorted(set(int(n) for n in est_list))
+
+    val_logloss_mean = []
+    val_acc_mean = []
+    val_f1_mean = []
+
+    print("[INFO] 学習曲線（n_estimators vs log loss / accuracy / macro-F1）を計算します...")
+    print(f"[INFO] 評価する n_estimators: {est_list}")
+
+    for n_estimators in est_list:
+        ll_scores = []
+        acc_scores = []
+        f1_scores_list = []
+
+        for train_idx, valid_idx in cv.split(X, y):
+            X_tr, X_val = X[train_idx], X[valid_idx]
+            y_tr, y_val = y[train_idx], y[valid_idx]
+
+            # 分類器をクローンして n_estimators を上書き
+            clf = clone(base_clf)
+            if hasattr(clf, "set_params"):
+                clf.set_params(n_estimators=int(n_estimators))
+
+            # imputer も都度クローンして Pipeline を作り直す
+            if imputer is not None:
+                imp = clone(imputer)
+                from sklearn.pipeline import Pipeline as SkPipeline
+
+                model = SkPipeline(
+                    [("imputer", imp), (clf_name, clf)]
+                )
+            else:
+                model = clf
+
+            model.fit(X_tr, y_tr)
+
+            # 予測確率（log loss 用）
+            if hasattr(model, "predict_proba"):
+                y_proba = model.predict_proba(X_val)
+            elif hasattr(model, "decision_function"):
+                # decision_function から softmax で擬似確率化
+                scores = model.decision_function(X_val)
+                scores = np.atleast_2d(scores)
+                scores = scores - scores.max(axis=1, keepdims=True)
+                exp_scores = np.exp(scores)
+                y_proba = exp_scores / exp_scores.sum(axis=1, keepdims=True)
+            else:
+                y_proba = None
+
+            y_pred = model.predict(X_val)
+
+            # log loss（確率が取れない場合は NaN）
+            if y_proba is not None:
+                try:
+                    ll = log_loss(y_val, y_proba, labels=np.unique(y))
+                except Exception:
+                    ll = np.nan
+            else:
+                ll = np.nan
+
+            ll_scores.append(ll)
+            acc_scores.append(accuracy_score(y_val, y_pred))
+            f1_scores_list.append(f1_score(y_val, y_pred, average="macro"))
+
+        val_logloss_mean.append(float(np.nanmean(ll_scores)))
+        val_acc_mean.append(float(np.mean(acc_scores)))
+        val_f1_mean.append(float(np.mean(f1_scores_list)))
+
+    # === プロット（2 段） ===
+    fig, (ax1, ax2) = plt.subplots(
+        nrows=2,
+        ncols=1,
+        figsize=(8, 8),
+        sharex=True,
+        constrained_layout=True,
+    )
+
+    # 上段: log loss
+    ax1.plot(est_list, val_logloss_mean, marker="o")
+    ax1.set_ylabel("Validation log loss")
+    ax1.set_title(
+        f"Learning curve (eval={eval_mode})\nmain metric: validation log loss"
+    )
+    ax1.grid(True)
+
+    # 下段: Accuracy / Macro-F1
+    ax2.plot(est_list, val_acc_mean, marker="o", label="Accuracy")
+    ax2.plot(est_list, val_f1_mean, marker="s", label="Macro F1")
+    ax2.set_xlabel("n_estimators")
+    ax2.set_ylabel("Accuracy / Macro-F1")
+    ax2.grid(True)
+    ax2.legend(loc="best")
+
+    save_path = out_dir / f"{run_id_prefix}_learning_curve_{eval_mode}_{run_id}.png"
+
+    # 追加: 学習曲線の元データ（評価指標の推移）も CSV で保存
+    try:
+        import pandas as pd
+        csv_path = out_dir / f"{run_id_prefix}_learning_curve_{eval_mode}_{run_id}.csv"
+
+        # n_estimators はループで使ったスカラーではなく、評価に使った一覧 est_list を保存する
+        df_lc = pd.DataFrame({
+            "n_estimators": est_list,
+            "val_logloss_mean": val_logloss_mean,
+            "val_acc_mean": val_acc_mean,
+            "val_f1_mean": val_f1_mean,
+        })
+        df_lc.to_csv(csv_path, index=False, encoding="utf-8-sig")
+        print(f"[保存] 学習曲線 元データ: {csv_path}")
+    except Exception as e:
+        print(f"[WARN] 学習曲線 元データの保存に失敗しました: {e}")
+
+    fig.savefig(save_path, dpi=150)
     plt.close(fig)
 
+    print(f"[INFO] 学習曲線を保存しました: {save_path}")
 
 # =========================================================
 # ユーティリティ
@@ -1436,9 +1636,21 @@ def train_mode(backend: str = "rf"):
     # 共通: 層化を使うかどうか
     use_stratify = ask_yes_no("層化サンプリング / 層化CV を使いますか？", default=True)
 
+    # 共通: 学習曲線を出力するかどうか
+    print("\n[オプション] 学習曲線（Learning Curve）の出力設定")
+    enable_learning_curve = ask_yes_no(
+        "[オプション] 学習曲線の PNG（Accuracy / F1-macro vs 木の本数 n_estimators）を出力しますか？\n"
+        "  ※ n_estimators の値に応じて学習に少し時間がかかります。",
+        default=False,
+    )
     # -------------------------------
     # モデル別パラメータ設定
     # -------------------------------
+    # class_weight は現状 RF / XGBoost とも None 固定。
+    # （クラス不均衡への対応は、サンプリング設計などで統一的に扱う想定）
+    # ※ 将来、クラス重みを対話的に指定したくなったらここを書き換える。
+    class_weight = None
+
     if backend == "xgb":
         print("\n[XGBoost パラメータ設定]")
     else:
@@ -1495,11 +1707,6 @@ def train_mode(backend: str = "rf"):
                 colsample_bytree = 0.8
         else:
             colsample_bytree = 0.8
-
-        # class_weight は XGBoost では直接利用せず、
-        # RandomForest 側でも「balanced」指定は行わずに None 固定とする
-        # （クラス不均衡への対応は、今後サンプリング設計などで統一的に扱う前提）
-        class_weight = None
 
     if backend == "xgb":
         if XGBClassifier is None:
@@ -1613,6 +1820,20 @@ def train_mode(backend: str = "rf"):
                 n_splits=n_splits,
                 test_size=test_size,
                 random_state=random_state,
+            )
+
+        # Monte Carlo と同じ分割設定を用いた学習曲線（任意）
+        if enable_learning_curve:
+            print("\n[Learning Curve] Monte Carlo CV 設定で学習曲線を計算中...")
+            _plot_learning_curve(
+                pipe,
+                X,
+                y,
+                cv=cv,
+                out_dir=out_dir,
+                run_id=run_id,
+                run_id_prefix=run_id_prefix,
+                eval_mode="montecarlo",
             )
 
         scoring = {
@@ -1875,6 +2096,20 @@ def train_mode(backend: str = "rf"):
                 n_splits=k_splits, shuffle=True, random_state=random_state
             )
 
+        # k-fold と同じ分割設定を用いた学習曲線（任意）
+        if enable_learning_curve:
+            print("\n[Learning Curve] k-fold CV 設定で学習曲線を計算中...")
+            _plot_learning_curve(
+                pipe,
+                X,
+                y,
+                cv=cv,
+                out_dir=out_dir,
+                run_id=run_id,
+                run_id_prefix=run_id_prefix,
+                eval_mode="kfold",
+            )
+
         print("\n[クロスバリデーション中...]")
         scoring = {
             "accuracy": "accuracy",
@@ -2053,6 +2288,33 @@ def train_mode(backend: str = "rf"):
                 stratify_arr = None
         else:
             stratify_arr = None
+
+        # --- 学習曲線（ホールドアウト設定に基づく ShuffleSplit） ---
+        if enable_learning_curve:
+            print("\n[Learning Curve] ホールドアウト設定に基づく学習曲線を計算中...")
+            if use_stratify and stratify_arr is not None:
+                cv_lc = StratifiedShuffleSplit(
+                    n_splits=5,
+                    test_size=test_size,
+                    random_state=random_state,
+                )
+            else:
+                cv_lc = ShuffleSplit(
+                    n_splits=5,
+                    test_size=test_size,
+                    random_state=random_state,
+                )
+
+            _plot_learning_curve(
+                pipe,
+                X,
+                y,
+                cv=cv_lc,
+                out_dir=out_dir,
+                run_id=run_id,
+                run_id_prefix=run_id_prefix,
+                eval_mode="holdout",
+            )
 
         indices = np.arange(len(df))
         idx_train, idx_test = train_test_split(
