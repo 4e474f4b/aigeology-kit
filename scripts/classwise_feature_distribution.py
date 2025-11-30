@@ -81,6 +81,34 @@ def get_array_module() -> Tuple[Any, str]:
     print("[INFO] NumPy CPU モードで実行します。")
     return np, "cpu"
 
+def print_environment_info(mode: str) -> None:
+    """OS / Python / 計算環境 をまとめて表示するヘルパ関数。
+
+    Parameters
+    ----------
+    mode : {"gpu", "cpu"}
+        get_array_module() から返ってくるモード文字列。
+    """
+    os_name = platform.system()
+    os_release = platform.release()
+    py_version = sys.version.split()[0]
+
+    if mode == "gpu":
+        compute_env = "GPU（CuPy 使用）"
+    else:
+        if HAS_CUPY:
+            # CuPy 自体はインポート可能だが、GPU が使えない / 使っていないケース
+            compute_env = "CPU（CuPy 実行）"
+        else:
+            compute_env = "CPU のみ（CuPy 未使用）"
+
+    print("=== 実行環境情報 ===")
+    print(f"- OS         : {os_name} {os_release}")
+    print(f"- Python     : {py_version}")
+    print(f"- 計算環境   : {compute_env}")
+    print("====================\\n")
+
+
 
 # =========================================================
 # ユーティリティ関数
@@ -472,6 +500,7 @@ def main():
 
     # 起動直後にCPU/GPUモードを表示
     xp, xp_mode = get_array_module()
+    print_environment_info(xp_mode)
 
 
     in_path_str = input("入力ファイルのパス（CSV / Parquet / GPKG）: ").strip()
