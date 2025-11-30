@@ -40,8 +40,6 @@ import os
 import sys
 import math
 import re
-from pathlib import Path
-
 import pandas as pd
 import numpy as np
 
@@ -53,7 +51,35 @@ except Exception:
     HAS_CUPY = False
 
 import matplotlib.pyplot as plt
-from typing import List
+from pathlib import Path
+from typing import List, Any, Tuple
+
+
+# =========================================================
+# GPU / CPU 自動切り替えヘルパ
+# =========================================================
+
+def get_array_module() -> Tuple[Any, str]:
+    """利用可能なら CuPy(GPU)、そうでなければ NumPy(CPU) を返す。
+    戻り値: (xp, mode) で、mode は "gpu" または "cpu"。
+    """
+    if HAS_CUPY:
+        try:
+            # GPU デバイスが 1 台以上あるか確認
+            ndev = cp.cuda.runtime.getDeviceCount()
+            if ndev > 0:
+                dev = cp.cuda.Device(0)
+                dev.use()
+                try:
+                    name = dev.name
+                except Exception:
+                    name = "GPU"
+                print(f"[INFO] CuPy GPU モードで実行します (device 0 = {name}, count={ndev}).")
+                return cp, "gpu"
+        except Exception as e:
+            print(f"[WARN] CuPy は import されていますが GPU 初期化に失敗しました: {e}")
+    print("[INFO] NumPy CPU モードで実行します。")
+    return np, "cpu"
 
 
 # =========================================================
@@ -215,16 +241,17 @@ def compute_classwise_stats(
     df: pd.DataFrame,
     label_col: str,
     numeric_cols: list[str],
+    xp: Any,
 ) -> pd.DataFrame:
+    """クラス列 label_col ごとに numeric_cols の統計量を計算し、ロング形式 DataFrame を返す。
+    xp には NumPy または CuPy を渡す。
     """
-    クラス列 label_col ごとに numeric_cols の統計量を計算し、ロング形式 DataFrame を返す。
-    """
-    results = []
-
-    total_rows = len(df)
+    results: list[dict] = []
 
     # groupby でクラスごとに処理
     groups = df.groupby(label_col, dropna=False)
+
+    use_gpu = xp is not np
 
     for label_value, sub in groups:
         print(f"[INFO] クラス '{label_value}' を処理中... (行数: {len(sub)})")
@@ -240,37 +267,65 @@ def compute_classwise_stats(
                 "total": int(total),
                 "count": int(series.size),
                 "missing": int(total - series.size),
-                "missing_ratio": float((total - series.size) / total) if total > 0 else np.nan,
+                "missing_ratio": float((total - series.size) / total) if total > 0 else float("nan"),
             }
 
-            if series.size == 0:
-                # すべて欠損
-                rec.update({
-                    "mean": np.nan,
-                    "std": np.nan,
-                    "min": np.nan,
-                    "max": np.nan,
-                    "q05": np.nan,
-                    "q25": np.nan,
-                    "q50": np.nan,
-                    "q75": np.nan,
-                    "q95": np.nan,
-                    "skew": np.nan,
-                })
+            if series.empty:
+                # データが空の場合
+                rec.update(
+                    {
+                        "mean": np.nan,
+                        "std": np.nan,
+                        "min": np.nan,
+                        "max": np.nan,
+                        "q05": np.nan,
+                        "q25": np.nan,
+                        "q50": np.nan,
+                        "q75": np.nan,
+                        "q95": np.nan,
+                        "skew": np.nan,
+                    }
+                )
             else:
-                desc = series.describe(percentiles=[0.05, 0.25, 0.5, 0.75, 0.95])
-                rec.update({
-                    "mean": float(desc.get("mean", np.nan)),
-                    "std": float(desc.get("std", np.nan)),
-                    "min": float(desc.get("min", np.nan)),
-                    "max": float(desc.get("max", np.nan)),
-                    "q05": float(desc.get("5%", np.nan)),
-                    "q25": float(desc.get("25%", np.nan)),
-                    "q50": float(desc.get("50%", np.nan)),
-                    "q75": float(desc.get("75%", np.nan)),
-                    "q95": float(desc.get("95%", np.nan)),
-                    "skew": float(series.skew()),
-                })
+                # GPU / CPU 共通のベクトル演算で統計量を計算
+                arr = series.to_numpy(dtype=float)
+                if use_gpu:
+                    arr_x = xp.asarray(arr)
+                else:
+                    arr_x = arr  # NumPy 配列として扱う
+
+                # 基本統計量
+                mean = float(xp.mean(arr_x))
+                std = float(xp.std(arr_x, ddof=1)) if arr_x.size > 1 else float("nan")
+                amin = float(xp.min(arr_x))
+                amax = float(xp.max(arr_x))
+
+                # パーセンタイル
+                q = xp.percentile(arr_x, [5, 25, 50, 75, 95])
+                q05, q25, q50, q75, q95 = [float(v) for v in (q[0], q[1], q[2], q[3], q[4])]
+
+                # 歪度 (skewness) を自前で計算
+                if arr_x.size > 1 and std not in (0.0, -0.0):
+                    # (x - mean)^3 の平均 / std^3
+                    m3 = xp.mean((arr_x - mean) ** 3)
+                    skew = float(m3 / (std ** 3))
+                else:
+                    skew = float("nan")
+
+                rec.update(
+                    {
+                        "mean": mean,
+                        "std": std,
+                        "min": amin,
+                        "max": amax,
+                        "q05": q05,
+                        "q25": q25,
+                        "q50": q50,
+                        "q75": q75,
+                        "q95": q95,
+                        "skew": skew,
+                    }
+                )
 
             results.append(rec)
 
@@ -334,10 +389,13 @@ def plot_histograms_per_class(
     numeric_cols: list[str],
     bins: int,
     out_dir: Path,
+    xp: Any,
 ) -> None:
-    """クラス別 × 数値列別にヒストグラム PNG / CSV を出力する"""
-
+    """クラス別 × 数値列別にヒストグラム PNG / CSV を出力する。
+    xp には NumPy または CuPy を渡す。
+    """
     groups = df.groupby(label_col, dropna=False)
+    use_gpu = xp is not np
 
     for label_value, sub in groups:
         # クラスラベル文字列（NaN の場合も含め安全な文字列にする）
@@ -346,9 +404,11 @@ def plot_histograms_per_class(
         else:
             label_str = str(label_value)
 
+        # ファイル名に使えるようにサニタイズ
+        # ※ 既存の safe_filename() を利用
         label_safe = safe_filename(label_str)
 
-        # クラスごとのサブフォルダを作成
+        # クラスごとの出力ディレクトリ
         class_dir = out_dir / f"class_{label_safe}"
         class_dir.mkdir(parents=True, exist_ok=True)
 
@@ -359,24 +419,17 @@ def plot_histograms_per_class(
                 print(f"[WARN] クラス '{label_str}' / 特徴量 '{feature}' は有効データがありません。スキップします。")
                 continue
 
-            # --- ヒストグラム PNG 出力 ---
-            plt.figure()
-            plt.hist(series, bins=bins, edgecolor="black", alpha=0.7)
-            plt.title(f"{feature} (class = {label_str})")
-            plt.xlabel(feature)
-            plt.ylabel("Frequency")
-            plt.grid(True, alpha=0.3)
-            plt.tight_layout()
+            # --- ヒストグラム元データ（counts, bin_edges） ---
+            arr = series.to_numpy(dtype=float)
+            if use_gpu:
+                arr_x = xp.asarray(arr)
+                counts, bin_edges = xp.histogram(arr_x, bins=bins)
+                # matplotlib / pandas 用に CPU 側に戻す
+                counts = np.asarray(counts)
+                bin_edges = np.asarray(bin_edges)
+            else:
+                counts, bin_edges = np.histogram(arr, bins=bins)
 
-            png_name = f"{feature}__class_{label_safe}_hist.png"
-            png_path = class_dir / png_name
-            plt.savefig(png_path, dpi=150)
-            plt.close()
-
-            print(f"[OK] ヒストグラム出力: {png_path}")
-
-            # --- ヒストグラム元データ CSV 出力 ---
-            counts, bin_edges = np.histogram(series, bins=bins)
             bin_left = bin_edges[:-1]
             bin_right = bin_edges[1:]
 
@@ -391,9 +444,24 @@ def plot_histograms_per_class(
             csv_name = f"{feature}__class_{label_safe}_hist.csv"
             csv_path = class_dir / csv_name
             hist_df.to_csv(csv_path, index=False)
-
             print(f"[OK] ヒストグラム元データ CSV 出力: {csv_path}")
 
+            # --- ヒストグラム PNG 出力 ---
+            plt.figure()
+            # bins は bin_edges を使うことで CPU/GPU どちらでも同じ階級幅になる
+            plt.hist(series, bins=bin_edges, edgecolor="black", alpha=0.7)
+            plt.title(f"{feature} (class = {label_str})")
+            plt.xlabel(feature)
+            plt.ylabel("Frequency")
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+
+            png_name = f"{feature}__class_{label_safe}_hist.png"
+            png_path = class_dir / png_name
+            plt.savefig(png_path, dpi=150)
+            plt.close()
+
+            print(f"[OK] ヒストグラム出力: {png_path}")
 
 # =========================================================
 # メイン処理
@@ -401,6 +469,10 @@ def plot_histograms_per_class(
 
 def main():
     print("=== クラス別 特徴量分布チェックツール ===")
+
+    # 起動直後にCPU/GPUモードを表示
+    xp, xp_mode = get_array_module()
+
 
     in_path_str = input("入力ファイルのパス（CSV / Parquet / GPKG）: ").strip()
     in_path_str = strip_quotes(in_path_str)
@@ -508,7 +580,7 @@ def main():
 
     # 統計量の計算
     print("\n[INFO] クラス別統計量を計算しています...")
-    stats_df = compute_classwise_stats(df, label_col, target_numeric_cols)
+    stats_df = compute_classwise_stats(df, label_col, target_numeric_cols, xp)
 
     if not stats_df.empty:
         stats_path = out_dir / "classwise_numeric_summary_stats.csv"
@@ -522,7 +594,7 @@ def main():
 
     # ヒストグラムの出力
     print("\n[INFO] クラス別ヒストグラムを作成しています...")
-    plot_histograms_per_class(df, label_col, target_numeric_cols, bins, out_dir)
+    plot_histograms_per_class(df, label_col, target_numeric_cols, bins, out_dir, xp)
 
     print("\n[INFO] すべての処理が完了しました。")
 
