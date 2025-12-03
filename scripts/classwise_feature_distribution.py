@@ -33,13 +33,14 @@
 
 ヒストグラム出力:
   - ファイル名: {feature}__class_{label_sanitized}_hist.png
-    （クラスラベル中の / \ : * ? " < > | などは _ に置換）
+    （クラスラベル中の記号類（/ やバックスラッシュ、: * ? " < > | など）は _ に置換）
 """
 
 import os
 import sys
 import math
 import re
+import platform
 import pandas as pd
 import numpy as np
 
@@ -70,12 +71,24 @@ def get_array_module() -> Tuple[Any, str]:
             if ndev > 0:
                 dev = cp.cuda.Device(0)
                 dev.use()
+                # --- ここで「実際にカーネルが動くか」簡易テストする ---
                 try:
-                    name = dev.name
-                except Exception:
-                    name = "GPU"
-                print(f"[INFO] CuPy GPU モードで実行します (device 0 = {name}, count={ndev}).")
-                return cp, "gpu"
+                    _ = cp.arange(10, dtype=cp.float32).mean().item()
+                except Exception as e:
+                    # nvrtc など CUDA 周りがおかしいとここで落ちるので CPU にフォールバック
+                    print(
+                        "[WARN] CuPy は import されていますが GPU カーネル実行テストに失敗したため、"
+                        f"CPU モードにフォールバックします: {e}"
+                    )
+                else:
+                    try:
+                        name = dev.name
+                    except Exception:
+                        name = "GPU"
+                    print(
+                        f"[INFO] CuPy GPU モードで実行します (device 0 = {name}, count={ndev})."
+                    )
+                    return cp, "gpu"
         except Exception as e:
             print(f"[WARN] CuPy は import されていますが GPU 初期化に失敗しました: {e}")
     print("[INFO] NumPy CPU モードで実行します。")
@@ -106,7 +119,8 @@ def print_environment_info(mode: str) -> None:
     print(f"- OS         : {os_name} {os_release}")
     print(f"- Python     : {py_version}")
     print(f"- 計算環境   : {compute_env}")
-    print("====================\\n")
+    print("====================")
+    print()
 
 
 
@@ -452,9 +466,9 @@ def plot_histograms_per_class(
             if use_gpu:
                 arr_x = xp.asarray(arr)
                 counts, bin_edges = xp.histogram(arr_x, bins=bins)
-                # matplotlib / pandas 用に CPU 側に戻す
-                counts = np.asarray(counts)
-                bin_edges = np.asarray(bin_edges)
+                # CuPy 配列を明示的に CPU 側 NumPy 配列へ転送
+                counts = counts.get()
+                bin_edges = bin_edges.get()
             else:
                 counts, bin_edges = np.histogram(arr, bins=bins)
 
