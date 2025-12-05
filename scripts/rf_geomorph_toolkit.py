@@ -1169,59 +1169,171 @@ def make_training_data_mode():
         poly_for_extent = None
 
     else:
-        if not polygons:
-            print("ポリゴンGPKGが見つからないため、手動入力に切り替えます。")
-            try:
-                xmin = float(input("xmin: ").strip())
-                ymin = float(input("ymin: ").strip())
-                xmax = float(input("xmax: ").strip())
-                ymax = float(input("ymax: ").strip())
-            except Exception:
-                print("数値として解釈できませんでした。終了します。")
-                return
-            poly_for_extent = None
+        poly_for_extent = None
+
+        # まず範囲用GPKGをどうするか決める
+        print("\n[範囲用ポリゴンGPKGの指定]")
+        if poly_for_attr:
+            print(f"  現在のポリゴン属性用GPKG: {poly_for_attr}")
+        if polygons:
+            print("  検出されたポリゴンGPKG一覧:")
+            for i, g in enumerate(polygons):
+                print(f"    [P{i:02d}] {g}")
+        ext_path_in = input("  範囲用GPKGのフルパス（空=上の一覧/属性用から選択）: ").strip()
+
+        if ext_path_in:
+            # 任意パスを直接指定
+            poly_for_extent = strip_quotes(ext_path_in)
         else:
-            # 範囲取得用 GPKG
-            if not poly_for_attr:
-                print("\n[範囲用ポリゴンの選択]")
-                for i, g in enumerate(polygons):
-                    print(f"  [P{i:02d}] {g}")
-                p_idx = input("範囲用ポリゴンGPKGの番号（例: 0 または P0）: ").strip()
-
-                if not p_idx:
-                    print("番号が空です。範囲 2) を選んだ場合は必ずどれかを指定してください。")
-                    print("必要なければ、範囲 1) 手動入力 を選んでください。")
-                    return
-
-                m = re.fullmatch(r"[Pp](\d+)", p_idx)
-                if m:
-                    p_idx = m.group(1)
+            # 何も指定されなかった場合は、既存情報から決める
+            if not polygons and not poly_for_attr:
+                print("ポリゴンGPKGが見つからないため、手動入力に切り替えます。")
                 try:
-                    p_i = int(p_idx)
-                except ValueError:
-                    print("番号が不正です。終了します。")
+                    xmin = float(input("xmin: ").strip())
+                    ymin = float(input("ymin: ").strip())
+                    xmax = float(input("xmax: ").strip())
+                    ymax = float(input("ymax: ").strip())
+                except Exception:
+                    print("数値として解釈できませんでした。終了します。")
                     return
-                if not (0 <= p_i < len(polygons)):
-                    print("番号が不正です。終了します。")
-                    return
-                poly_for_extent = polygons[p_i]
+                poly_for_extent = None
             else:
-                poly_for_extent = poly_for_attr
+                # 範囲取得用 GPKG を既存から選ぶ
+                if not poly_for_attr:
+                    print("\n[範囲用ポリゴンの選択]")
+                    for i, g in enumerate(polygons):
+                        print(f"  [P{i:02d}] {g}")
+                    p_idx = input("範囲用ポリゴンGPKGの番号（例: 0 または P0）: ").strip()
 
+                    if not p_idx:
+                        print("番号が空です。範囲 2) を選んだ場合は必ずどれかを指定してください。")
+                        print("必要なければ、範囲 1) 手動入力 を選んでください。")
+                        return
+
+                    m = re.fullmatch(r"[Pp](\d+)", p_idx)
+                    if m:
+                        p_idx = m.group(1)
+                    try:
+                        p_i = int(p_idx)
+                    except ValueError:
+                        print("番号が不正です。終了します。")
+                        return
+                    if not (0 <= p_i < len(polygons)):
+                        print("番号が不正です。終了します。")
+                        return
+                    poly_for_extent = polygons[p_i]
+                else:
+                    # すでにポリゴン属性用GPKGが選択されていれば、それを使う
+                    poly_for_extent = poly_for_attr
+
+        # ここまでで poly_for_extent が決まっていれば、その GPKG から bbox を取る
+        if poly_for_extent:
             try:
                 layers = fiona.listlayers(poly_for_extent)
-                print(f"  範囲用GPKGのレイヤ一覧: {', '.join(layers)}")
+                if not layers:
+                    print("  範囲用GPKGにレイヤが見つかりません。終了します。")
+                    return
+
+                print("  範囲用GPKGのレイヤ一覧:")
+                for i, lname in enumerate(layers):
+                    print(f"    [{i:02d}] {lname}")
+
+                sel_layer = input("  使用レイヤの番号（空=0）: ").strip()
+                if sel_layer == "":
+                    # 何も指定されなければ 0 番目
+                    layer_name = layers[0]
+                else:
+                    try:
+                        idx = int(sel_layer)
+                    except ValueError:
+                        # 数字じゃなければ「名前で直接指定された」とみなす
+                        if sel_layer in layers:
+                            layer_name = sel_layer
+                        else:
+                            print("  ⚠ 指定されたレイヤ名/番号が正しくありません。最初のレイヤを使用します。")
+                            layer_name = layers[0]
+                    else:
+                        if 0 <= idx < len(layers):
+                            layer_name = layers[idx]
+                        else:
+                            print("  ⚠ 指定された番号が範囲外です。最初のレイヤを使用します。")
+                            layer_name = layers[0]
+
             except Exception:
-                layers = None
-                print("  （レイヤ一覧の取得に失敗しました）")
+                print("  （レイヤ一覧の取得に失敗しました。レイヤ未指定で読み込みを試みます）")
+                layer_name = None
 
-            layer_name = input("  使用レイヤ名（空=最初のレイヤ）: ").strip()
-            if not layer_name and layers:
-                layer_name = layers[0]
+            extent_gdf = gpd.read_file(poly_for_extent, layer=layer_name)
 
-            extent_gdf = gpd.read_file(poly_for_extent, layer=layer_name or None)
+            # --- 属性列・属性値で範囲ポリゴンを絞り込む（任意） ---
+            attr_cols = [c for c in extent_gdf.columns if c.lower() != "geometry"]
+            used_attr = None
+            used_value = None
+
+            if attr_cols:
+                print("\n  [範囲ポリゴンの絞り込み（任意）]")
+                print("  このレイヤに含まれる属性列:")
+                for i, c in enumerate(attr_cols):
+                    print(f"    [{i:02d}] {c}")
+                sel_attr = input("  範囲選択に使う属性列の番号（空=絞り込みなし）: ").strip()
+
+                if sel_attr:
+                    try:
+                        attr_idx = int(sel_attr)
+                    except ValueError:
+                        print("  ⚠ 番号が不正のため、絞り込みは行わず全ポリゴンを対象とします。")
+                    else:
+                        if 0 <= attr_idx < len(attr_cols):
+                            used_attr = attr_cols[attr_idx]
+                            # ユニーク値ではなく、「行ごと」に候補として扱う
+                            rows = extent_gdf[[used_attr]].dropna(subset=[used_attr])
+                            if rows.empty:
+                                print("  ⚠ 選択された属性列に有効な値が無いため、絞り込みは行いません。")
+                                used_attr = None
+                            else:
+                                # 元のインデックスと値を保持
+                                idx_list = list(rows.index)
+                                vals = list(rows[used_attr])
+
+                                print(f"\n  属性列 '{used_attr}' の値一覧（行ごと）:")
+                                for i, (idx, v) in enumerate(zip(idx_list, vals)):
+                                    print(f"    [{i:03d}] fid={idx}  {v}")
+
+                                sel_val = input("  外接矩形を取りたい行の番号（空=絞り込みなし）: ").strip()
+                                if sel_val:
+                                    try:
+                                        val_idx = int(sel_val)
+                                    except ValueError:
+                                        print("  ⚠ 番号が不正のため、絞り込みは行わず全ポリゴンを対象とします。")
+                                        used_attr = None
+                                    else:
+                                        if 0 <= val_idx < len(idx_list):
+                                            # 選ばれた 1 行だけを対象にする
+                                            chosen_idx = idx_list[val_idx]
+                                            used_value = vals[val_idx]
+                                            subset = extent_gdf.loc[[chosen_idx]]
+                                            if subset.empty:
+                                                print("  ⚠ 絞り込み後のポリゴンが 0 件のため、全ポリゴンを対象とします。")
+                                                used_attr = None
+                                                used_value = None
+                                            else:
+                                                extent_gdf = subset
+                                        else:
+                                            print("  ⚠ 番号が範囲外のため、絞り込みは行わず全ポリゴンを対象とします。")
+                                            used_attr = None
+
+            # --- 最終的な外接矩形 ---
             xmin, ymin, xmax, ymax = extent_gdf.total_bounds
-            print(f"  → ポリゴン外接矩形: xmin={xmin:.3f}, ymin={ymin:.3f}, xmax={xmax:.3f}, ymax={ymax:.3f}")
+            if used_attr is not None and used_value is not None:
+                print(
+                    f"  → 属性 '{used_attr}' = '{used_value}' のポリゴン外接矩形: "
+                    f"xmin={xmin:.3f}, ymin={ymin:.3f}, xmax={xmax:.3f}, ymax={ymax:.3f}"
+                )
+            else:
+                print(
+                    f"  → ポリゴン全体の外接矩形: "
+                    f"xmin={xmin:.3f}, ymin={ymin:.3f}, xmax={xmax:.3f}, ymax={ymax:.3f}"
+                )
 
     # --- 解像度 ---
     res_in = input("\nグリッド解像度（サンプリング間隔、単位は座標系と同じ）[1.0]: ").strip()
