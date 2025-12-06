@@ -104,6 +104,7 @@ import os
 import sys
 import json
 import sqlite3
+use_label_encoder = False
 
 try:
     import pyarrow.parquet as _pq  # Parquet のメタ情報取得用（あれば使う）
@@ -120,9 +121,10 @@ import pandas as pd
 from sklearn.model_selection import (
     train_test_split,
     StratifiedKFold,
-    KFold,
     StratifiedShuffleSplit,
+    KFold,
     ShuffleSplit,
+    cross_val_score,
     cross_validate,
     cross_val_predict,
 )
@@ -304,7 +306,9 @@ def _plot_confusion_matrix(cm, labels, normalize=False,
                            title="Confusion matrix", cmap=None, save_path=None):
     """
     混同行列を画像として保存するヘルパー。
-    labels: クラスラベルのリスト（len(labels) == cm.shape[0] を想定）
+    labels: クラスラベルのリスト
+             - 原則 len(labels) == cm.shape[0] を想定
+             - ずれている場合は行列サイズに合わせて自動調整する
     """
     if normalize:
         with np.errstate(all="ignore"):
@@ -313,16 +317,44 @@ def _plot_confusion_matrix(cm, labels, normalize=False,
     else:
         cm_plot = cm
 
+    # === ラベル数と行列サイズの整合性をとる =========================
+    n_classes = cm_plot.shape[0]
+
+    if labels is None:
+        # ラベルが渡されていない場合は 0,1,2,... の文字列にする
+        labels_for_plot = [str(i) for i in range(n_classes)]
+    else:
+        labels_for_plot = list(labels)
+
+    if len(labels_for_plot) != n_classes:
+        # sklearn.metrics.confusion_matrix は、labels を指定しないと
+        # 「テストデータに実際に出現したクラスのみ」を採用するため、
+        # classification_report ベースのラベル一覧とズレることがある。
+        # （例: support=0 のクラスが classification_report には出るが、
+        #       confusion_matrix には含まれない）
+        print(
+            f"[WARN] labels の数 {len(labels_for_plot)} と混同行列のサイズ "
+            f"{n_classes} が一致しません。行列サイズに合わせてラベルを調整します。"
+        )
+        if len(labels_for_plot) > n_classes:
+            # 余っているラベルは末尾を切り捨て
+            labels_for_plot = labels_for_plot[:n_classes]
+        else:
+            # 足りない場合はダミーラベルで埋める（通常は起こりにくい）
+            labels_for_plot = labels_for_plot + [
+                f"class_{i}" for i in range(len(labels_for_plot), n_classes)
+            ]
+
     fig, ax = plt.subplots(figsize=(6, 5))
     im = ax.imshow(cm_plot, interpolation="nearest", cmap=cmap or "Blues")
     ax.figure.colorbar(im, ax=ax)
     ax.set_title(title)
 
-    tick_marks = np.arange(len(labels))
+    tick_marks = np.arange(len(labels_for_plot))
     ax.set_xticks(tick_marks)
-    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_xticklabels(labels_for_plot, rotation=45, ha="right")
     ax.set_yticks(tick_marks)
-    ax.set_yticklabels(labels)
+    ax.set_yticklabels(labels_for_plot)
     ax.set_ylabel("True label")
     ax.set_xlabel("Predicted label")
 
@@ -339,6 +371,7 @@ def _plot_confusion_matrix(cm, labels, normalize=False,
     fig.tight_layout()
 
     if save_path:
+        # 図を PNG として保存
         fig.savefig(save_path, dpi=150)
 
         # 追加: 図の元データ（cm_plot）を CSV でも保存
@@ -347,7 +380,11 @@ def _plot_confusion_matrix(cm, labels, normalize=False,
             from pathlib import Path
 
             csv_path = Path(save_path).with_suffix(".csv")
-            df_cm = pd.DataFrame(cm_plot, index=labels, columns=labels)
+            df_cm = pd.DataFrame(
+                cm_plot,
+                index=labels_for_plot,
+                columns=labels_for_plot,
+            )
             df_cm.to_csv(csv_path, encoding="utf-8-sig")
             print(f"[保存] 混同行列データ CSV: {csv_path}")
         except Exception as e:
@@ -355,7 +392,7 @@ def _plot_confusion_matrix(cm, labels, normalize=False,
 
         plt.close(fig)
 
-    print(f"[INFO] 混同行列を保存しました: {save_path}")
+        print(f"[INFO] 混同行列を保存しました: {save_path}")
 
 
 def _plot_learning_curve(
@@ -371,7 +408,7 @@ def _plot_learning_curve(
     """
     n_estimators を横軸にした学習曲線を描画する。
 
-    - 上段: 検証 log loss（メイン指標）
+    - 上段: 学習 / 検証 log loss（メイン指標）
     - 下段: 検証 Accuracy / Macro-F1
     """
     if cv is None:
@@ -423,6 +460,7 @@ def _plot_learning_curve(
     )
     est_list = sorted(set(int(n) for n in est_list))
 
+    train_logloss_mean = []
     val_logloss_mean = []
     val_acc_mean = []
     val_f1_mean = []
@@ -431,7 +469,8 @@ def _plot_learning_curve(
     print(f"[INFO] 評価する n_estimators: {est_list}")
 
     for n_estimators in est_list:
-        ll_scores = []
+        train_ll_scores = []
+        val_ll_scores = []
         acc_scores = []
         f1_scores_list = []
 
@@ -457,35 +496,53 @@ def _plot_learning_curve(
 
             model.fit(X_tr, y_tr)
 
-            # 予測確率（log loss 用）
+            # 予測確率（log loss 用: 学習 / 検証の両方）
             if hasattr(model, "predict_proba"):
-                y_proba = model.predict_proba(X_val)
+                y_proba_tr = model.predict_proba(X_tr)
+                y_proba_val = model.predict_proba(X_val)
             elif hasattr(model, "decision_function"):
-                # decision_function から softmax で擬似確率化
-                scores = model.decision_function(X_val)
-                scores = np.atleast_2d(scores)
-                scores = scores - scores.max(axis=1, keepdims=True)
-                exp_scores = np.exp(scores)
-                y_proba = exp_scores / exp_scores.sum(axis=1, keepdims=True)
+                # decision_function から softmax で擬似確率化（学習 / 検証）
+                scores_tr = model.decision_function(X_tr)
+                scores_tr = np.atleast_2d(scores_tr)
+                scores_tr = scores_tr - scores_tr.max(axis=1, keepdims=True)
+                exp_scores_tr = np.exp(scores_tr)
+                y_proba_tr = exp_scores_tr / exp_scores_tr.sum(axis=1, keepdims=True)
+
+                scores_val = model.decision_function(X_val)
+                scores_val = np.atleast_2d(scores_val)
+                scores_val = scores_val - scores_val.max(axis=1, keepdims=True)
+                exp_scores_val = np.exp(scores_val)
+                y_proba_val = exp_scores_val / exp_scores_val.sum(axis=1, keepdims=True)
             else:
-                y_proba = None
+                y_proba_tr = None
+                y_proba_val = None
 
             y_pred = model.predict(X_val)
 
             # log loss（確率が取れない場合は NaN）
-            if y_proba is not None:
+            if y_proba_tr is not None:
                 try:
-                    ll = log_loss(y_val, y_proba, labels=np.unique(y))
+                    ll_tr = log_loss(y_tr, y_proba_tr, labels=np.unique(y))
                 except Exception:
-                    ll = np.nan
+                    ll_tr = np.nan
             else:
-                ll = np.nan
+                ll_tr = np.nan
 
-            ll_scores.append(ll)
+            if y_proba_val is not None:
+                try:
+                    ll_val = log_loss(y_val, y_proba_val, labels=np.unique(y))
+                except Exception:
+                    ll_val = np.nan
+            else:
+                ll_val = np.nan
+
+            train_ll_scores.append(ll_tr)
+            val_ll_scores.append(ll_val)
             acc_scores.append(accuracy_score(y_val, y_pred))
             f1_scores_list.append(f1_score(y_val, y_pred, average="macro"))
 
-        val_logloss_mean.append(float(np.nanmean(ll_scores)))
+        train_logloss_mean.append(float(np.nanmean(train_ll_scores)))
+        val_logloss_mean.append(float(np.nanmean(val_ll_scores)))
         val_acc_mean.append(float(np.mean(acc_scores)))
         val_f1_mean.append(float(np.mean(f1_scores_list)))
 
@@ -498,13 +555,15 @@ def _plot_learning_curve(
         constrained_layout=True,
     )
 
-    # 上段: log loss
-    ax1.plot(est_list, val_logloss_mean, marker="o")
-    ax1.set_ylabel("Validation log loss")
+    # 上段: log loss（学習 / 検証）
+    ax1.plot(est_list, train_logloss_mean, marker="o", label="Train log loss")
+    ax1.plot(est_list, val_logloss_mean, marker="s", label="Validation log loss")
+    ax1.set_ylabel("log loss")
     ax1.set_title(
         f"Learning curve (eval={eval_mode})\nmain metric: validation log loss"
     )
     ax1.grid(True)
+    ax1.legend(loc="best")
 
     # 下段: Accuracy / Macro-F1
     ax2.plot(est_list, val_acc_mean, marker="o", label="Accuracy")
@@ -524,6 +583,7 @@ def _plot_learning_curve(
         # n_estimators はループで使ったスカラーではなく、評価に使った一覧 est_list を保存する
         df_lc = pd.DataFrame({
             "n_estimators": est_list,
+            "train_logloss_mean": train_logloss_mean,
             "val_logloss_mean": val_logloss_mean,
             "val_acc_mean": val_acc_mean,
             "val_f1_mean": val_f1_mean,
@@ -646,6 +706,27 @@ def ask_yes_no(prompt: str, default: bool | None = None) -> bool:
         if s in ("n", "no"):
             return False
         print("  'y' か 'n' で答えてください。")
+
+def ask_thinning_factor(prompt: str, default: int = 1) -> int:
+    """
+    GPKG 書き出し時の間引き率を尋ねるヘルパ。
+      - 1   : 間引きなし（全件）
+      - 10  : 1/10（10 行ごとに 1 行）
+      - 100 : 1/100 ...
+    """
+    while True:
+        s = input(f"{prompt}（1=間引きなし）: ").strip()
+        if not s:
+            return max(1, int(default))
+        try:
+            v = int(s)
+        except ValueError:
+            print("  ⚠ 整数として解釈できません。もう一度入力してください。")
+            continue
+        if v < 1:
+            print("  ⚠ 1 以上の整数を指定してください。")
+            continue
+        return v
 
 def _safe_read_table(path: str | Path) -> pd.DataFrame:
     """
@@ -1680,6 +1761,7 @@ def train_mode(backend: str = "rf"):
     # モデル出力先（ルートフォルダ）を先に決めておく
     print("\n[モデル出力設定]")
     base = Path(path)
+    base_name = base.stem
     default_root = base.with_suffix("").parent / "rf_models"
     out_root_in = strip_quotes(
         input(f"モデル保存ルートフォルダ（空={default_root}）: ").strip()
@@ -1708,19 +1790,35 @@ def train_mode(backend: str = "rf"):
         class_names = sorted(pd.unique(y))
         label_encoder_info = None
 
-    # オプション: 評価結果を地図上で確認するための座標列（x/y）
-    xy_cols = None
+    # オプション: 評価結果を地図上で確認するための座標列（x/y）＋間引き率＋EPSG
+    xy_cols: tuple[str, str] | None = None
+    eval_gpkg_thinning: int | None = None
+    eval_crs_epsg: str | None = None
+
     if ask_yes_no(
-        "\n評価結果を GPKG（ポイント）として出力しますか？\n  → テーブル内に x/y 座標列がある場合のみ有効です。",
+        "\n評価結果を GPKG（ポイント）として出力しますか？\n"
+        "  → テーブル内に x/y 座標列がある場合のみ有効です。",
         default=False,
     ):
+        # ★ ここで間引き率を聞く（LabelEncoder メッセージと [座標列の確認] の間）
+        eval_gpkg_thinning = ask_thinning_factor(
+            "  → y の場合、間引き率を指定してください"
+            "（例: 1=全件, 10=1/10, 1000=1/1000。空=1）: ",
+            default=1,
+        )
         try:
+            # ここから [座標列の確認]
             x_col, y_col = ensure_xy_columns(df)
             xy_cols = (x_col, y_col)
+            # x/y 確定の直後で EPSG も聞いて、変数に保持しておく
+            eval_crs_epsg = ask_crs(default_epsg=None)
         except Exception as e:
             xy_cols = None
+            eval_gpkg_thinning = None
+            eval_crs_epsg = None
             print(
-                f"  ⚠ x/y 座標列の指定に失敗したため、このセッションでは評価用 GPKG の出力をスキップします: {e}"
+                "  ⚠ x/y 座標列の指定に失敗したため、このセッションでは"
+                f"評価用 GPKG の出力をスキップします: {e}"
             )
 
     X = df[feature_cols].values.astype(float)
@@ -1921,12 +2019,25 @@ def train_mode(backend: str = "rf"):
             print("  ⚠ 0〜0.5 の範囲外なので 0.2 を使います。")
             test_size = 0.2
 
+        # 層化サンプリングの可否をチェック（クラス数や最小サンプル数が少なすぎるとエラーになる）
         if use_stratify:
-            cv = StratifiedShuffleSplit(
-                n_splits=n_splits,
-                test_size=test_size,
-                random_state=random_state,
-            )
+            unique_mc, counts_mc = np.unique(y, return_counts=True)
+            if len(unique_mc) > 1 and np.all(counts_mc >= 2):
+                cv = StratifiedShuffleSplit(
+                    n_splits=n_splits,
+                    test_size=test_size,
+                    random_state=random_state,
+                )
+            else:
+                print(
+                    "  ⚠ クラス数が 1 つ、または一部クラスのサンプル数が少なすぎるため "
+                    "Monte Carlo では層化サンプリングを無効化します。"
+                )
+                cv = ShuffleSplit(
+                    n_splits=n_splits,
+                    test_size=test_size,
+                    random_state=random_state,
+                )
         else:
             cv = ShuffleSplit(
                 n_splits=n_splits,
@@ -2036,15 +2147,15 @@ def train_mode(backend: str = "rf"):
                     print(f"  → Monte Carlo 最終分割の classification_report を保存しました: {rep_path_mc}")
                 except Exception as e:
                     print(f"  ⚠ Monte Carlo 最終分割の classification_report 保存に失敗しました: {e}")
-                print(classification_report(y_test_cv, y_pred_cv))
 
             if class_names is not None:
                 cm_labels = [str(c) for c in class_names]
             else:
                 cm_labels = [str(i) for i in range(cm.shape[0])]
 
-            cm_abs_path = out_dir / f"rf_confusion_matrix_{run_id}.png"
-            cm_norm_path = out_dir / f"rf_confusion_matrix_normalized_{run_id}.png"
+            # ★ Monte Carlo 用とわかるファイル名に変更
+            cm_abs_path = out_dir / f"rf_confusion_matrix_mc_last_{run_id}.png"
+            cm_norm_path = out_dir / f"rf_confusion_matrix_mc_last_normalized_{run_id}.png"
             _plot_confusion_matrix(
                 cm,
                 cm_labels,
@@ -2060,32 +2171,44 @@ def train_mode(backend: str = "rf"):
                 save_path=cm_norm_path,
             )
 
-            # --- ここから GPKG 出力（最後の分割のテストデータ） ---
-            if xy_cols is not None:
+            # Monte Carlo: 最終分割の評価結果を GPKG で出力（指定間引き対応）
+            if xy_cols is not None and eval_gpkg_thinning is not None:
                 x_col, y_col = xy_cols
                 if (x_col in df.columns) and (y_col in df.columns):
                     eval_df = df.iloc[idx_test_cv].copy()
-                    # 元のラベル（decode 済み）と予測ラベルを格納
+                    # 元のラベルをそのまま true_label として保存
+                    eval_df["true_label"] = df[target_col].iloc[idx_test_cv].values
+
+                    # 予測ラベル（LabelEncoder 使用時は decode）
                     if label_encoder_info is not None:
-                        true_labels = df[target_col].iloc[idx_test_cv].values
-                        pred_labels = le.inverse_transform(y_pred_cv)
+                        try:
+                            le_local = LabelEncoder()
+                            le_local.classes_ = np.array(label_encoder_info["classes_"])
+                            pred_labels = le_local.inverse_transform(y_pred_cv)
+                        except Exception:
+                            pred_labels = y_pred_cv
                     else:
-                        true_labels = y_test_cv
                         pred_labels = y_pred_cv
-
-                    eval_df["true_label"] = true_labels
                     eval_df["pred_label"] = pred_labels
+
                     eval_df["is_correct"] = (
-                        eval_df["true_label"] == eval_df["pred_label"]
+                        eval_df["true_label"].astype(str)
+                        == eval_df["pred_label"].astype(str)
                     )
 
-                    print(
-                        "\n[オプション] Monte Carlo 最終分割の評価結果を GPKG として保存します。"
-                    )
-                    crs_epsg = ask_crs(default_epsg=None)
-                    eval_gpkg_path = (
-                        out_dir / f"{base.stem}_eval_mc_last_{run_id}.gpkg"
-                    )
+                    thinning = eval_gpkg_thinning if eval_gpkg_thinning and eval_gpkg_thinning > 1 else 1
+                    if thinning > 1:
+                        before_n = len(eval_df)
+                        eval_df = eval_df.iloc[::thinning].copy()
+                        print(
+                            "  → Monte Carlo 最終分割の評価 GPKG を "
+                            f"{thinning} 行ごとに 1 行に間引き "
+                            f"{before_n} 件 → {len(eval_df)} 件を書き出します。"
+                        )
+
+                    # 事前に取得した EPSG を利用（念のため未設定ならここで聞く）
+                    crs_epsg = eval_crs_epsg or ask_crs(default_epsg=None)
+                    eval_gpkg_path = out_dir / f"{base.stem}_eval_mc_last_{run_id}.gpkg"
                     save_gpkg_with_points(
                         eval_df,
                         eval_gpkg_path,
@@ -2094,71 +2217,19 @@ def train_mode(backend: str = "rf"):
                         crs_epsg=crs_epsg,
                         layer_name="eval_mc_last",
                     )
-                    print(f"[保存] Monte Carlo 最終分割 GPKG: {eval_gpkg_path}")
+                    print(f"[保存] Monte Carlo 最終分割 評価 GPKG: {eval_gpkg_path}")
                 else:
                     print(
-                        "  ⚠ 指定された座標列が df に存在しないため、Monte Carlo 評価用 GPKG の出力をスキップします。"
+                        "  ⚠ 指定された座標列が df に存在しないため、"
+                        "Monte Carlo 評価用 GPKG の出力をスキップします。"
                     )
-
-        # -------------------------------
-        # Monte Carlo: 「最後の分割」について混同行列を作成
-        # -------------------------------
-        print("\n[評価（Monte Carlo: 最終スプリットの混同行列）]")
-        last_train_idx, last_test_idx = None, None
-        for train_idx, test_idx in cv.split(X, y):
-            last_train_idx, last_test_idx = train_idx, test_idx
-
-        if last_train_idx is not None and last_test_idx is not None:
-            X_train_cv = X[last_train_idx]
-            X_test_cv  = X[last_test_idx]
-            y_train_cv = y[last_train_idx]
-            y_test_cv  = y[last_test_idx]
-
-            pipe.fit(X_train_cv, y_train_cv)
-            y_pred_cv = pipe.predict(X_test_cv)
-
-            cm = confusion_matrix(y_test_cv, y_pred_cv)
-            print("混同行列（行: 真, 列: 予測）:")
-            print(cm)
-            print("\nclassification_report:")
-
-            if label_encoder_info and class_names:
-                all_labels = np.arange(len(class_names))
+            else:
                 print(
-                    classification_report(
-                        y_test_cv,
-                        y_pred_cv,
-                        labels=all_labels,
-                        target_names=[str(c) for c in class_names],
-                        zero_division=0,
-                    )
+                    "  ⚠ 評価用 GPKG 出力は無効です（座標列が無いか、GPKG 出力オプションが OFF です）。"
                 )
-            else:
-                print(classification_report(y_test_cv, y_pred_cv))
 
-            if class_names is not None:
-                cm_labels = [str(c) for c in class_names]
-            else:
-                cm_labels = [str(i) for i in range(cm.shape[0])]
-
-            cm_abs_path = out_dir / f"rf_confusion_matrix_{run_id}.png"
-            cm_norm_path = out_dir / f"rf_confusion_matrix_normalized_{run_id}.png"
-            _plot_confusion_matrix(
-                cm,
-                cm_labels,
-                normalize=False,
-                title="Confusion matrix (Monte Carlo: last split)",
-                save_path=cm_abs_path,
-            )
-            _plot_confusion_matrix(
-                cm,
-                cm_labels,
-                normalize=True,
-                title="Confusion matrix (Monte Carlo: last split, normalized)",
-                save_path=cm_norm_path,
-            )
-
-        # Monte Carlo CV では OOF 混同行列は作らず、スコア平均＋最後の分割だけ可視化
+        # Monte Carlo CV では OOF 混同行列は作らず、
+        # スコア平均＋最終分割（上で可視化済み）のみとする
         print("\n[最終モデルの学習（全データで再学習）...]")
         pipe.fit(X, y)
         print("学習完了。")
@@ -2200,9 +2271,22 @@ def train_mode(backend: str = "rf"):
             k_splits = 5
 
         if use_stratify:
-            cv = StratifiedKFold(
-                n_splits=k_splits, shuffle=True, random_state=random_state
-            )
+            # 層化k-foldが成立するかチェック
+            #  - クラスが2種類以上
+            #  - 全クラスでサンプル数 >= k_splits
+            unique_cv, counts_cv = np.unique(y, return_counts=True)
+            if len(unique_cv) > 1 and np.all(counts_cv >= k_splits):
+                cv = StratifiedKFold(
+                    n_splits=k_splits, shuffle=True, random_state=random_state
+                )
+            else:
+                print(
+                    "  ⚠ クラス数が 1 つ、または一部クラスのサンプル数が "
+                    f"k={k_splits} 未満のため、層化 k-fold を無効化します。"
+                )
+                cv = KFold(
+                    n_splits=k_splits, shuffle=True, random_state=random_state
+                )
         else:
             cv = KFold(
                 n_splits=k_splits, shuffle=True, random_state=random_state
@@ -2334,10 +2418,21 @@ def train_mode(backend: str = "rf"):
                     eval_df["true_label"] == eval_df["pred_label"]
                 )
 
+                # 事前に指定した eval_gpkg_thinning を適用（1 なら全件）
+                if eval_gpkg_thinning and eval_gpkg_thinning > 1:
+                    before_n = len(eval_df)
+                    eval_df = eval_df.iloc[::eval_gpkg_thinning].copy()
+                    print(
+                        "  → CV OOF 評価 GPKG を "
+                        f"{eval_gpkg_thinning} 行ごとに 1 行に間引き "
+                        f"{before_n} 件 → {len(eval_df)} 件を書き出します。"
+                    )
+
                 print(
                     "\n[オプション] CV OOF 評価結果を GPKG として保存します。"
                 )
-                crs_epsg = ask_crs(default_epsg=None)
+                # 事前に取得した EPSG を利用（念のため未設定ならここで聞く）
+                crs_epsg = eval_crs_epsg or ask_crs(default_epsg=None)
                 eval_cv_gpkg_path = (
                     out_dir / f"{base.stem}_eval_cv_oof_{run_id}.gpkg"
                 )
@@ -2520,41 +2615,71 @@ def train_mode(backend: str = "rf"):
             save_path=cm_norm_path,
         )
 
-        # オプション: テストデータの評価結果を GPKG（ポイント）として保存
-        if xy_cols is not None:
-            x_col, y_col = xy_cols
+        # オプション: ホールドアウト法のテストデータを評価用 GPKG として出力（指定間引き対応）
+        eval_gpkg_path = None
+        if xy_cols is not None and eval_gpkg_thinning is not None:
+            # x,y 列名の取り出し
+            if isinstance(xy_cols, tuple):
+                x_col, y_col = xy_cols
+            else:
+                x_col, y_col = xy_cols[0], xy_cols[1]
+
             if (x_col in df.columns) and (y_col in df.columns):
+                # テストデータ部分のみ抽出
                 eval_df = df.iloc[idx_test].copy()
+                # 元のラベルをそのまま true_label として保存
                 eval_df["true_label"] = df[target_col].iloc[idx_test].values
+
+                # 予測ラベル（LabelEncoder 使用時は decode）
                 if label_encoder_info is not None:
-                    pred_labels = le.inverse_transform(y_pred)
+                    try:
+                        le_local = LabelEncoder()
+                        le_local.classes_ = np.array(label_encoder_info["classes_"])
+                        pred_labels = le_local.inverse_transform(y_pred)
+                    except Exception:
+                        pred_labels = y_pred
                 else:
                     pred_labels = y_pred
                 eval_df["pred_label"] = pred_labels
+
+                # 正誤フラグ
                 eval_df["is_correct"] = (
-                    eval_df["true_label"] == eval_df["pred_label"]
+                    eval_df["true_label"].astype(str)
+                    == eval_df["pred_label"].astype(str)
                 )
 
-                print("\n[オプション] テストデータ評価結果を GPKG として保存します。")
-                crs_epsg = ask_crs(default_epsg=None)
-                eval_gpkg_path = out_dir / f"{base.stem}_eval_rf_ho_{run_id}.gpkg"
+                # 間引き（1 ならそのまま）
+                thinning = eval_gpkg_thinning if eval_gpkg_thinning and eval_gpkg_thinning > 1 else 1
+                if thinning > 1:
+                    before_n = len(eval_df)
+                    eval_df = eval_df.iloc[::thinning].copy()
+                    print(
+                        "  → ホールドアウト評価 GPKG を "
+                        f"{thinning} 行ごとに 1 行に間引き "
+                        f"{before_n} 件 → {len(eval_df)} 件を書き出します。"
+                    )
+
+                # 事前に取得した EPSG を利用（念のため未設定ならここで聞く）
+                crs_epsg = eval_crs_epsg or ask_crs(default_epsg=None)
+                eval_gpkg_path = out_dir / f"{base.stem}_eval_holdout_{run_id}.gpkg"
                 save_gpkg_with_points(
                     eval_df,
                     eval_gpkg_path,
                     x_col=x_col,
                     y_col=y_col,
                     crs_epsg=crs_epsg,
-                    layer_name="eval_test",
+                    layer_name="eval_holdout",
                 )
-                print(f"[保存] テスト評価 GPKG: {eval_gpkg_path}")
+                print(f"[保存] ホールドアウト評価用 GPKG: {eval_gpkg_path}")
             else:
-                eval_gpkg_path = None
                 print(
-                    "  ⚠ 指定された座標列が df に存在しないため、評価用 GPKG の出力をスキップします。"
+                    "  ⚠ 指定された座標列が df に存在しないため、ホールドアウト評価用 "
+                    "GPKG の出力をスキップします。"
                 )
         else:
-            eval_gpkg_path = None
-
+            print(
+                "  ⚠ 評価用 GPKG 出力は無効です（座標列が無いか、GPKG 出力オプションが OFF です）。"
+            )
         eval_mode = "holdout"
         eval_info = {
             "test_size": test_size,
@@ -2678,6 +2803,50 @@ def load_model_and_meta():
         meta = json.load(f)
     print(f"[INFO] モデルとメタ情報を読み込みました。run_id={meta.get('run_id')}")
     return pipe, meta, model_path, meta_path
+
+
+def _predict_in_chunks(pipe, df, feature_cols, chunk_size: int | None):
+    """
+    メモリを抑えるため、チャンク単位で予測を行うヘルパー。
+    - pipe         : 学習済み Pipeline
+    - df           : 入力 DataFrame（特徴量列をすでに含む）
+    - feature_cols : 特徴量列名リスト
+    - chunk_size   : 1 回に処理する最大行数（None または 0 以下なら全件）
+    """
+    n_rows = len(df)
+    if n_rows == 0:
+        return np.empty((0,), dtype=float), None
+
+    if not chunk_size or chunk_size <= 0 or chunk_size >= n_rows:
+        chunk_size = n_rows
+
+    use_proba = hasattr(pipe, "predict_proba")
+    y_list = []
+    proba_list = [] if use_proba else None
+
+    print(f"\n[INFO] チャンク予測を実行します（チャンクサイズ: {chunk_size:,} 行）")
+
+    for start in range(0, n_rows, chunk_size):
+        end = min(start + chunk_size, n_rows)
+        print(f"  - 行 {start:,} ～ {end-1:,} を予測中...", end="", flush=True)
+
+        X_chunk = df[feature_cols].iloc[start:end].to_numpy(dtype=np.float32)
+        y_chunk = pipe.predict(X_chunk)
+        y_list.append(y_chunk)
+
+        if use_proba:
+            proba_chunk = pipe.predict_proba(X_chunk)
+            proba_list.append(proba_chunk.max(axis=1))
+
+        print(" done")
+
+    y_pred = np.concatenate(y_list, axis=0)
+    if use_proba:
+        proba_max = np.concatenate(proba_list, axis=0)
+    else:
+        proba_max = None
+
+    return y_pred, proba_max
 
 
 def predict_mode():
@@ -2880,15 +3049,33 @@ def predict_mode():
         for c in missing_feats:
             df[c] = np.nan
 
-    X = df[saved_feats].values.astype(float)
+    # -----------------------------------------------------
+    # チャンクサイズの設定（大規模データ向け）
+    # -----------------------------------------------------
+    print("\n[予測設定: チャンクサイズ]")
+    print("大量データの場合、チャンク単位で予測してメモリ使用量を抑えます。")
+    print("空 Enter でデフォルト値（200,000 行）を使用します。")
 
+    default_chunk_size = 200_000
+    chunk_size = default_chunk_size
+    ans_chunk = input(
+        f"一度に処理する最大行数（例: 100000 / 200000 / 500000、空={default_chunk_size:,}）: "
+    ).strip()
+    if ans_chunk:
+        try:
+            v = int(ans_chunk)
+            if v > 0:
+                chunk_size = v
+            else:
+                print("  ⚠ 0 以下は指定できないため、デフォルト値を使用します。")
+        except ValueError:
+            print("  ⚠ 整数として解釈できないため、デフォルト値を使用します。")
+
+    # -----------------------------------------------------
+    # チャンク単位で予測
+    # -----------------------------------------------------
     print("\n[予測中...]")
-    y_pred = pipe.predict(X)
-    if hasattr(pipe, "predict_proba"):
-        proba = pipe.predict_proba(X)
-        proba_max = proba.max(axis=1)
-    else:
-        proba_max = None
+    y_pred, proba_max = _predict_in_chunks(pipe, df, saved_feats, chunk_size)
 
     # ラベルを元に戻す（予測側）
     if label_encoder_info and class_names:
@@ -3129,11 +3316,20 @@ def predict_mode():
 
     # =====================================================
     # 予測結果の GPKG 出力（predict 実行時）
-    #   ※ 正解ラベルの有無にかかわらず全件を出力
-    #   ※ 正解ラベルがある場合は true_label / is_correct を付与
+    #   pred / eval それぞれについて
+    #     - GPKG を出すか？
+    #     - 間引き率
+    #     - x/y 列
+    #     - CRS (EPSG)
+    #   まず「設定フェーズ」でこれらを決めてから、
+    #   最後にまとめて GPKG を書き出す。
     # =====================================================
     try:
-        # ベースとなる DataFrame（全行）
+        # -------------------------------
+        # ベース DataFrame の準備
+        # -------------------------------
+        pred_df = out.copy()
+        eval_df = None
         if target_col in df.columns:
             eval_df = out.copy()
             eval_df["true_label"] = df[target_col]
@@ -3141,34 +3337,108 @@ def predict_mode():
                 eval_df["true_label"].astype(str)
                 == eval_df["y_pred"].astype(str)
             )
-            gpkg_df = eval_df
-            layer_name = "eval_predict"
-            suffix = "eval_predict_all"
-        else:
-            gpkg_df = out.copy()
-            layer_name = "pred"
-            suffix = "pred_all"
 
-        if gpkg_df.empty:
-            print("\n[INFO] 予測結果が空のため、GPKG の出力はスキップします。")
+        # -------------------------------
+        # 設定フェーズ
+        # -------------------------------
+        pred_gpkg_enable = False
+        pred_thinning = 1
+        pred_x_col = None
+        pred_y_col = None
+        pred_crs_epsg = None
+
+        eval_gpkg_enable = False
+        eval_thinning = 1
+        eval_x_col = None
+        eval_y_col = None
+        eval_crs_epsg = None
+
+        # --- pred 用設定 ---
+        if pred_df is not None and not pred_df.empty:
+            print("\n[オプション] 予測結果 GPKG（y_pred / proba_max のみ）を出力します。")
+            if ask_yes_no("  → 予測結果 GPKG を保存しますか？", default=False):
+                pred_gpkg_enable = True
+                pred_thinning = ask_thinning_factor(
+                    "  [pred] GPKG に書き出す間引き率を指定してください（例: 10=1/10, 100=1/100）",
+                    default=1,
+                )
+                pred_x_col, pred_y_col = ensure_xy_columns(pred_df)
+                pred_default_crs = source_crs_str or "EPSG:4326"
+                pred_crs_epsg = ask_crs(default_epsg=pred_default_crs)
+            else:
+                print("  → 予測結果 GPKG の出力はスキップします。")
         else:
-            print("\n[オプション] 予測結果（全件）を GPKG として出力します。")
-            # x,y 列は自動検出＋対話式選択
-            x_col, y_col = ensure_xy_columns(gpkg_df)
-            default_crs = source_crs_str or "EPSG:4326"
-            crs_epsg = ask_crs(default_epsg=default_crs)
-            gpkg_path = (
-                out_dir / f"{Path(base_out).name}_{suffix}_{run_id}.gpkg"
+            print("\n[INFO] 予測結果が空のため、pred GPKG の設定・出力はスキップします。")
+
+        # --- eval 用設定（target_col があるときだけ） ---
+        if eval_df is not None:
+            if not eval_df.empty:
+                print("\n[オプション] 評価用 GPKG（true_label / is_correct 付き）を出力します。")
+                if ask_yes_no("  → 評価用 GPKG を保存しますか？", default=False):
+                    eval_gpkg_enable = True
+                    eval_thinning = ask_thinning_factor(
+                        "  [eval] GPKG に書き出す間引き率を指定してください（例: 10=1/10, 100=1/100）",
+                        default=1,
+                    )
+                    eval_x_col, eval_y_col = ensure_xy_columns(eval_df)
+                    eval_default_crs = source_crs_str or "EPSG:4326"
+                    eval_crs_epsg = ask_crs(default_epsg=eval_default_crs)
+                else:
+                    print("  → 評価用 GPKG の出力はスキップします。")
+            else:
+                print("\n[INFO] 評価対象が空のため、eval GPKG の設定・出力はスキップします。")
+        else:
+            print("\n[INFO] 入力テーブルに正解ラベルが無いため、評価用 GPKG は作成できません。")
+
+        # -------------------------------
+        # 書き出しフェーズ
+        # -------------------------------
+        # pred GPKG
+        if pred_gpkg_enable:
+            if pred_thinning and pred_thinning > 1:
+                pred_gpkg_out = pred_df.iloc[::pred_thinning].copy()
+                print(
+                    f"  → [pred] {pred_thinning} 行ごとに 1 行を採用して "
+                    f"{len(pred_gpkg_out)} 件を書き出します。"
+                )
+            else:
+                pred_gpkg_out = pred_df
+
+            pred_gpkg_path = out_dir / f"{Path(base_out).name}_pred_{run_id}.gpkg"
+            save_gpkg_with_points(
+                pred_gpkg_out,
+                pred_gpkg_path,
+                x_col=pred_x_col,
+                y_col=pred_y_col,
+                crs_epsg=pred_crs_epsg,
+                layer_name="pred",
+            )
+            print(f"  → 予測結果 GPKG を保存しました: {pred_gpkg_path}")
+
+        # eval GPKG
+        if eval_gpkg_enable:
+            if eval_thinning and eval_thinning > 1:
+                eval_gpkg_out = eval_df.iloc[::eval_thinning].copy()
+                print(
+                    f"  → [eval] {eval_thinning} 行ごとに 1 行を採用して "
+                    f"{len(eval_gpkg_out)} 件を書き出します。"
+                )
+            else:
+                eval_gpkg_out = eval_df
+
+            eval_gpkg_path = (
+                out_dir / f"{Path(base_out).name}_eval_predict_{run_id}.gpkg"
             )
             save_gpkg_with_points(
-                gpkg_df,
-                gpkg_path,
-                x_col=x_col,
-                y_col=y_col,
-                crs_epsg=crs_epsg,
-                layer_name=layer_name,
+                eval_gpkg_out,
+                eval_gpkg_path,
+                x_col=eval_x_col,
+                y_col=eval_y_col,
+                crs_epsg=eval_crs_epsg,
+                layer_name="eval_predict",
             )
-            print(f"  → 予測結果 GPKG を保存しました: {gpkg_path}")
+            print(f"  → 評価用 GPKG を保存しました: {eval_gpkg_path}")
+
     except Exception as e:
         print(f"  ⚠ 予測結果 GPKG の保存に失敗しました: {e}")
 
