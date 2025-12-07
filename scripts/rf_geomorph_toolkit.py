@@ -1724,7 +1724,7 @@ def _alias_candidates(col: str):
 # 学習（train）
 # =========================================================
 
-def train_mode(backend: str = "rf"):
+def train_mode(backend: str = "rf", preconfig: dict | None = None):
     """
     backend:
       "rf"  -> scikit-learn RandomForest（CPU）
@@ -1790,16 +1790,18 @@ def train_mode(backend: str = "rf"):
         class_names = sorted(pd.unique(y))
         label_encoder_info = None
 
-    # オプション: 評価結果を地図上で確認するための座標列（x/y）＋間引き率＋EPSG
-    xy_cols: tuple[str, str] | None = None
-    eval_gpkg_thinning: int | None = None
-    eval_crs_epsg: str | None = None
+    # オプション: 評価結果を地図上で確認するための座標列
+    print("\n--- 評価結果の GPKG 出力設定（オプション） ---")
+    print("【オプション】評価用 GPKG を作成できます。")
+    print("  ※ 評価用データ（ホールドアウト or CV の最後の分割）だけを出力します。")
+    print("  ※ 入力テーブルに 'x', 'y' または 'lon', 'lat' 系の座標列が含まれている必要があります。")
 
-    if ask_yes_no(
-        "\n評価結果を GPKG（ポイント）として出力しますか？\n"
-        "  → テーブル内に x/y 座標列がある場合のみ有効です。",
-        default=False,
-    ):
+    # preconfig による GPKG 出力の強制 OFF（バッチ / スイープ用）
+    disable_eval_gpkg = bool(preconfig.get("disable_eval_gpkg")) if preconfig else False
+
+    if disable_eval_gpkg:
+        print("[INFO] preconfig.disable_eval_gpkg=True のため、評価用 GPKG 出力はスキップします。")
+    elif ask_yes_no("評価結果を GPKG で出力しますか？ [y/N]: ", default=False):
         # ★ ここで間引き率を聞く（LabelEncoder メッセージと [座標列の確認] の間）
         eval_gpkg_thinning = ask_thinning_factor(
             "  → y の場合、間引き率を指定してください"
