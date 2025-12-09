@@ -97,6 +97,7 @@ def create_config_template(
     thin_rate_y: int | None = None,               # ←追加: y の間引き率
     output_epsg: str | None = None,               # ←追加: 保存する座標系
     max_rows: int | None = None,                  # ←追加: 学習＋検証に使う最大行数
+    test_size: float | None = None,              # ←変更: ホールドアウト時のテスト割合
 ) -> None:
     """
     CPU/GPU × 検証法パターンに応じたサンプル設定 JSON を生成する。
@@ -146,6 +147,11 @@ def create_config_template(
 
             # 検証法: 1=ホールドアウト, 2=Monte Carlo CV, 3=k-fold CV
             "val_mode": val_mode,
+
+            # ホールドアウト / Monte Carlo のときのテストデータ割合
+            # - None または未指定: train 側の既定値 0.2 を使用
+            # - 0 < test_size <= 0.5 の範囲を推奨（例: 0.1, 0.2, 0.3）  # ←変更
+            "test_size": test_size,
 
             # 共通パラメータ
             "random_state": 42,
