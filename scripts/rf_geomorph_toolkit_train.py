@@ -184,6 +184,31 @@ def save_gpkg_with_points(df, out_path, x_col="x", y_col="y",
     except Exception:
         gdf.to_file(out_path, driver="GPKG", layer=layer_name)
 
+def save_geoparquet_with_points(
+    df: pd.DataFrame,
+    out_path: Path,
+    x_col: str = "x",
+    y_col: str = "y",
+    crs_epsg: str = "EPSG:4326",
+) -> None:
+    """
+    x, y から Point geometry を生成して GeoParquet として保存するヘルパ。
+    """
+    from shapely.geometry import Point
+
+    if x_col not in df.columns or y_col not in df.columns:
+        raise ValueError(
+            f"GeoParquet 出力には '{x_col}', '{y_col}' 列が必要です。"
+        )
+
+    w = df.dropna(subset=[x_col, y_col]).copy()
+    w[x_col] = w[x_col].astype(float)
+    w[y_col] = w[y_col].astype(float)
+
+    geom = [Point(xy) for xy in zip(w[x_col].values, w[y_col].values)]
+    gdf = gpd.GeoDataFrame(w, geometry=geom, crs=crs_epsg)
+    gdf.to_parquet(out_path, index=False)
+
 def ask_crs(default_epsg="EPSG:4326"):
     """
     例: 'EPSG:6677', 'EPSG:4326', 'JGD2011 / Japan Plane Rectangular CS IX' など
@@ -728,6 +753,33 @@ def ask_thinning_factor(prompt: str, default: int = 1) -> int:
             continue
         return v
 
+def ask_vector_output_format(default: str = "both") -> tuple[bool, bool]:
+    """
+    評価結果ベクタの出力形式（GPKG / GeoParquet / 両方）を選ぶ。
+    戻り値: (save_gpkg, save_parquet)
+    """
+    default = default.lower()
+    default_map = {"gpkg": "1", "geoparquet": "2", "both": "3"}
+    default_choice = default_map.get(default, "3")
+
+    while True:
+        print("\n[ベクタ出力形式の選択]")
+        print("  1) GPKG（GeoPackage）のみ")
+        print("  2) GeoParquet のみ")
+        print("  3) 両方出力する")
+        s = input(f"番号を選んでください [1-3]（空={default_choice}）: ").strip()
+        if not s:
+            s = default_choice
+
+        if s == "1":
+            return True, False
+        if s == "2":
+            return False, True
+        if s == "3":
+            return True, True
+
+        print("  ⚠ 1〜3 の番号で入力してください。")
+
 def _safe_read_table(path: str | Path) -> pd.DataFrame:
     """
     CSV / Parquet / GPKG を自動判別して読み込む。
@@ -1176,15 +1228,21 @@ def train_mode(backend: str = "rf"):
     xy_cols: tuple[str, str] | None = None
     eval_gpkg_thinning: int | None = None
     eval_crs_epsg: str | None = None
+    # ベクタ出力形式フラグ
+    save_gpkg: bool = False
+    save_parquet: bool = False
 
     if ask_yes_no(
-        "\n評価結果を GPKG（ポイント）として出力しますか？\n"
-        "  → テーブル内に x/y 座標列がある場合のみ有効です。",
+        "\n評価結果をベクタ（ポイント）として出力しますか？\n"
+        "  → GPKG / GeoParquet。テーブル内に x/y 座標列がある場合のみ有効です。",
         default=False,
     ):
-        # ★ ここで間引き率を聞く（LabelEncoder メッセージと [座標列の確認] の間）
+        # 出力形式を選択
+        save_gpkg, save_parquet = ask_vector_output_format(default="both")
+
+        # 間引き率を指定
         eval_gpkg_thinning = ask_thinning_factor(
-            "  → y の場合、間引き率を指定してください"
+            "  [eval] GPKG に書き出す間引き率を指定してください"
             "（例: 1=全件, 10=1/10, 1000=1/1000。空=1）: ",
             default=1,
         )
@@ -1200,8 +1258,10 @@ def train_mode(backend: str = "rf"):
             eval_crs_epsg = None
             print(
                 "  ⚠ x/y 座標列の指定に失敗したため、このセッションでは"
-                f"評価用 GPKG の出力をスキップします: {e}"
+                f"評価用ベクタ（GPKG / GeoParquet）の出力をスキップします: {e}"
             )
+    else:
+        print("  → 評価用ベクタの出力はスキップします。")
 
     X = df[feature_cols].values.astype(float)
 
@@ -1478,6 +1538,8 @@ def train_mode(backend: str = "rf"):
 
             pipe.fit(X_train_cv, y_train_cv)
             y_pred_cv = pipe.predict(X_test_cv)
+            # 学習データ側の予測（train GPKG / GeoParquet 用）
+            y_pred_train_cv = pipe.predict(X_train_cv)
 
             # 混同行列・レポート（最後の分割）
             cm = confusion_matrix(y_test_cv, y_pred_cv)
@@ -1553,8 +1615,10 @@ def train_mode(backend: str = "rf"):
                 save_path=cm_norm_path,
             )
 
-            # Monte Carlo: 最終分割の評価結果を GPKG で出力（指定間引き対応）
-            if xy_cols is not None and eval_gpkg_thinning is not None:
+        # Monte Carlo: 最終分割の評価結果をベクタ（GPKG / GeoParquet）で出力（指定間引き対応）
+            eval_gpkg_path = None
+            eval_parquet_path = None
+            if xy_cols is not None and eval_gpkg_thinning is not None and (save_gpkg or save_parquet):
                 x_col, y_col = xy_cols
                 if (x_col in df.columns) and (y_col in df.columns):
                     eval_df = df.iloc[idx_test_cv].copy()
@@ -1583,14 +1647,16 @@ def train_mode(backend: str = "rf"):
                         before_n = len(eval_df)
                         eval_df = eval_df.iloc[::thinning].copy()
                         print(
-                            "  → Monte Carlo 最終分割の評価 GPKG を "
+                            "  → Monte Carlo 最終分割の評価ベクタを "
                             f"{thinning} 行ごとに 1 行に間引き "
                             f"{before_n} 件 → {len(eval_df)} 件を書き出します。"
                         )
 
                     # 事前に取得した EPSG を利用（念のため未設定ならここで聞く）
                     crs_epsg = eval_crs_epsg or ask_crs(default_epsg=None)
-                    eval_gpkg_path = out_dir / f"{base.stem}_eval_mc_last_{run_id}.gpkg"
+
+                    if save_gpkg:
+                        eval_gpkg_path = out_dir / f"{base.stem}_eval_mc_last_{run_id}.gpkg"
                     save_gpkg_with_points(
                         eval_df,
                         eval_gpkg_path,
@@ -1600,14 +1666,91 @@ def train_mode(backend: str = "rf"):
                         layer_name="eval_mc_last",
                     )
                     print(f"[保存] Monte Carlo 最終分割 評価 GPKG: {eval_gpkg_path}")
+
+                    # --- 学習データ側（train）の GPKG / GeoParquet も出力 ---
+                    train_df = df.iloc[idx_train_cv].copy()
+                    train_df["true_label"] = df[target_col].iloc[idx_train_cv].values
+
+                    if label_encoder_info is not None:
+                        try:
+                            le_local = LabelEncoder()
+                            le_local.classes_ = np.array(label_encoder_info["classes_"])
+                            train_pred_labels = le_local.inverse_transform(y_pred_train_cv)
+                        except Exception:
+                            train_pred_labels = y_pred_train_cv
+                    else:
+                        train_pred_labels = y_pred_train_cv
+                    train_df["pred_label"] = train_pred_labels
+
+                    train_df["is_correct"] = (
+                        train_df["true_label"].astype(str)
+                        == train_df["pred_label"].astype(str)
+                    )
+
+                    thinning_train = (
+                        eval_gpkg_thinning
+                        if eval_gpkg_thinning and eval_gpkg_thinning > 1
+                        else 1
+                    )
+                    if thinning_train > 1:
+                        before_n_train = len(train_df)
+                        train_df = train_df.iloc[::thinning_train].copy()
+                        print(
+                            "  → Monte Carlo 最終分割の学習用 GPKG / GeoParquet を "
+                            f"{thinning_train} 行ごとに 1 行に間引き "
+                            f"{before_n_train} 件 → {len(train_df)} 件を書き出します。"
+                        )
+
+                    if save_gpkg:
+                        train_gpkg_path = out_dir / f"{base.stem}_train_mc_last_{run_id}.gpkg"
+                        save_gpkg_with_points(
+                            train_df,
+                            train_gpkg_path,
+                            x_col=x_col,
+                            y_col=y_col,
+                            crs_epsg=crs_epsg,
+                            layer_name="train_mc_last",
+                        )
+                        print(f"[保存] Monte Carlo 最終分割 学習用 GPKG: {train_gpkg_path}")
+
+                    if save_parquet:
+                        # Monte Carlo 最終分割の学習用 GeoParquet も保存
+                        train_parquet_path = out_dir / f"{base.stem}_train_mc_last_{run_id}.parquet"
+                        try:
+                            save_geoparquet_with_points(
+                                train_df,
+                                train_parquet_path,
+                                x_col=x_col,
+                                y_col=y_col,
+                                crs_epsg=crs_epsg,
+                            )
+                            print(f"[保存] Monte Carlo 最終分割 学習用 GeoParquet: {train_parquet_path}")
+                        except Exception as e:
+                            print(
+                                f"[WARN] Monte Carlo 最終分割 学習用 GeoParquet の書き出しに失敗しました: {e}"
+                            )
+
+                    if save_parquet:
+                        eval_parquet_path = out_dir / f"{base.stem}_eval_mc_last_{run_id}.parquet"
+                        try:
+                            save_geoparquet_with_points(
+                                eval_df,
+                                eval_parquet_path,
+                                x_col=x_col,
+                                y_col=y_col,
+                                crs_epsg=crs_epsg,
+                            )
+                            print(f"[保存] Monte Carlo 最終分割 評価 GeoParquet: {eval_parquet_path}")
+                        except Exception as e:
+                            print(f"[WARN] Monte Carlo 最終分割 評価用 GeoParquet の書き出しに失敗しました: {e}")
                 else:
                     print(
                         "  ⚠ 指定された座標列が df に存在しないため、"
-                        "Monte Carlo 評価用 GPKG の出力をスキップします。"
+                        "Monte Carlo 評価用 GPKG / Parquet の出力をスキップします。"
                     )
             else:
                 print(
-                    "  ⚠ 評価用 GPKG 出力は無効です（座標列が無いか、GPKG 出力オプションが OFF です）。"
+                    "  ⚠ 評価用 GPKG / Parquet 出力は無効です（座標列が無いか、ベクタ出力オプションが OFF です）。"
                 )
 
         # Monte Carlo CV では OOF 混同行列は作らず、
@@ -1784,7 +1927,9 @@ def train_mode(backend: str = "rf"):
             save_path=cm_norm_path,
         )
 
-        # オプション: クロスバリデーション OOF 予測を GPKG（ポイント）として保存
+# オプション: クロスバリデーション OOF 予測を GPKG / GeoParquet（ポイント）として保存
+#   ※ k-fold CV では train 側 GPKG / GeoParquet は出力せず、
+#      OOF 評価用の eval_cv_oof のみをベクタ化する。
         if xy_cols is not None:
             x_col, y_col = xy_cols
             if (x_col in df.columns) and (y_col in df.columns):
@@ -1800,40 +1945,65 @@ def train_mode(backend: str = "rf"):
                     eval_df["true_label"] == eval_df["pred_label"]
                 )
 
+        eval_cv_gpkg_path = None
+        eval_cv_parquet_path = None
+
+        if xy_cols is not None and eval_gpkg_thinning is not None and (save_gpkg or save_parquet):
+            # x,y 列名の取り出し
+            if isinstance(xy_cols, tuple):
+                x_col, y_col = xy_cols
+            else:
+                x_col, y_col = xy_cols[0], xy_cols[1]
+
+            if (x_col in df.columns) and (y_col in df.columns):
                 # 事前に指定した eval_gpkg_thinning を適用（1 なら全件）
                 if eval_gpkg_thinning and eval_gpkg_thinning > 1:
                     before_n = len(eval_df)
                     eval_df = eval_df.iloc[::eval_gpkg_thinning].copy()
                     print(
-                        "  → CV OOF 評価 GPKG を "
+                        "  → CV OOF 評価ベクタを "
                         f"{eval_gpkg_thinning} 行ごとに 1 行に間引き "
                         f"{before_n} 件 → {len(eval_df)} 件を書き出します。"
                     )
 
-                print(
-                    "\n[オプション] CV OOF 評価結果を GPKG として保存します。"
-                )
+                print("\n[オプション] CV OOF 評価結果を GPKG / GeoParquet として保存します。")
                 # 事前に取得した EPSG を利用（念のため未設定ならここで聞く）
                 crs_epsg = eval_crs_epsg or ask_crs(default_epsg=None)
-                eval_cv_gpkg_path = (
-                    out_dir / f"{base.stem}_eval_cv_oof_{run_id}.gpkg"
-                )
-                save_gpkg_with_points(
-                    eval_df,
-                    eval_cv_gpkg_path,
-                    x_col=x_col,
-                    y_col=y_col,
-                    crs_epsg=crs_epsg,
-                    layer_name="eval_cv_oof",
-                )
-                print(f"[保存] CV OOF 評価 GPKG: {eval_cv_gpkg_path}")
+
+                if save_gpkg:
+                    eval_cv_gpkg_path = out_dir / f"{base.stem}_eval_cv_oof_{run_id}.gpkg"
+                    save_gpkg_with_points(
+                        eval_df,
+                        eval_cv_gpkg_path,
+                        x_col=x_col,
+                        y_col=y_col,
+                        crs_epsg=crs_epsg,
+                        layer_name="eval_cv_oof",
+                    )
+                    print(f"[保存] CV OOF 評価 GPKG: {eval_cv_gpkg_path}")
+
+                if save_parquet:
+                    eval_cv_parquet_path = out_dir / f"{base.stem}_eval_cv_oof_{run_id}.parquet"
+                    try:
+                        save_geoparquet_with_points(
+                            eval_df,
+                            eval_cv_parquet_path,
+                            x_col=x_col,
+                            y_col=y_col,
+                            crs_epsg=crs_epsg,
+                        )
+                        print(f"[保存] CV OOF 評価 GeoParquet: {eval_cv_parquet_path}")
+                    except Exception as e:
+                        print(f"[WARN] CV OOF 評価用 GeoParquet の書き出しに失敗しました: {e}")
             else:
                 eval_cv_gpkg_path = None
+                eval_cv_parquet_path = None
                 print(
-                    "  ⚠ 指定された座標列が df に存在しないため、CV 用 GPKG の出力をスキップします。"
+                    "  ⚠ 指定された座標列が df に存在しないため、CV 用 GPKG / Parquet の出力をスキップします。"
                 )
         else:
             eval_cv_gpkg_path = None
+            eval_cv_parquet_path = None
 
         # 最終モデルは全データでフィット
         print("\n[最終モデルの学習（全データで再学習）...]")
@@ -1847,6 +2017,8 @@ def train_mode(backend: str = "rf"):
         }
         if eval_cv_gpkg_path is not None:
             eval_info["eval_gpkg_path"] = str(eval_cv_gpkg_path)
+        if eval_cv_parquet_path is not None:
+            eval_info["eval_parquet_path"] = str(eval_cv_parquet_path)
          
     # ===== ホールドアウト法 =====
     else:
@@ -1922,6 +2094,8 @@ def train_mode(backend: str = "rf"):
 
         # 予測
         y_pred = pipe.predict(X_test)
+        # 学習データ側の予測（train GPKG / GeoParquet 用）
+        y_pred_train = pipe.predict(X_train)
 
         # 混同行列・レポート
         cm = confusion_matrix(y_test, y_pred)
@@ -1997,9 +2171,10 @@ def train_mode(backend: str = "rf"):
             save_path=cm_norm_path,
         )
 
-        # オプション: ホールドアウト法のテストデータを評価用 GPKG として出力（指定間引き対応）
+        # オプション: ホールドアウト法のテストデータを評価用ベクタ（GPKG / GeoParquet）として出力（指定間引き対応）
         eval_gpkg_path = None
-        if xy_cols is not None and eval_gpkg_thinning is not None:
+        eval_parquet_path = None
+        if xy_cols is not None and eval_gpkg_thinning is not None and (save_gpkg or save_parquet):
             # x,y 列名の取り出し
             if isinstance(xy_cols, tuple):
                 x_col, y_col = xy_cols
@@ -2036,31 +2211,110 @@ def train_mode(backend: str = "rf"):
                     before_n = len(eval_df)
                     eval_df = eval_df.iloc[::thinning].copy()
                     print(
-                        "  → ホールドアウト評価 GPKG を "
+                        "  → ホールドアウト評価ベクタを "
                         f"{thinning} 行ごとに 1 行に間引き "
                         f"{before_n} 件 → {len(eval_df)} 件を書き出します。"
                     )
 
                 # 事前に取得した EPSG を利用（念のため未設定ならここで聞く）
                 crs_epsg = eval_crs_epsg or ask_crs(default_epsg=None)
-                eval_gpkg_path = out_dir / f"{base.stem}_eval_holdout_{run_id}.gpkg"
-                save_gpkg_with_points(
-                    eval_df,
-                    eval_gpkg_path,
-                    x_col=x_col,
-                    y_col=y_col,
-                    crs_epsg=crs_epsg,
-                    layer_name="eval_holdout",
-                )
+
+                if save_gpkg:
+                    eval_gpkg_path = out_dir / f"{base.stem}_eval_holdout_{run_id}.gpkg"
+                    save_gpkg_with_points(
+                        eval_df,
+                        eval_gpkg_path,
+                        x_col=x_col,
+                        y_col=y_col,
+                        crs_epsg=crs_epsg,
+                        layer_name="eval_holdout",
+                    )
                 print(f"[保存] ホールドアウト評価用 GPKG: {eval_gpkg_path}")
+
+                # --- 学習データ側（train）の GPKG / GeoParquet も出力 ---
+                train_df = df.iloc[idx_train].copy()
+                train_df["true_label"] = df[target_col].iloc[idx_train].values
+
+                if label_encoder_info is not None:
+                    try:
+                        le_local = LabelEncoder()
+                        le_local.classes_ = np.array(label_encoder_info["classes_"])
+                        train_pred_labels = le_local.inverse_transform(y_pred_train)
+                    except Exception:
+                        train_pred_labels = y_pred_train
+                else:
+                    train_pred_labels = y_pred_train
+                train_df["pred_label"] = train_pred_labels
+
+                train_df["is_correct"] = (
+                    train_df["true_label"].astype(str)
+                    == train_df["pred_label"].astype(str)
+                )
+
+                thinning_train = (
+                    eval_gpkg_thinning
+                    if eval_gpkg_thinning and eval_gpkg_thinning > 1
+                    else 1
+                )
+                if thinning_train > 1:
+                    before_n_train = len(train_df)
+                    train_df = train_df.iloc[::thinning_train].copy()
+                    print(
+                        "  → ホールドアウト学習用 GPKG / GeoParquet を "
+                        f"{thinning_train} 行ごとに 1 行に間引き "
+                        f"{before_n_train} 件 → {len(train_df)} 件を書き出します。"
+                    )
+
+                if save_gpkg:
+                    train_gpkg_path = out_dir / f"{base.stem}_train_holdout_{run_id}.gpkg"
+                    save_gpkg_with_points(
+                        train_df,
+                        train_gpkg_path,
+                        x_col=x_col,
+                        y_col=y_col,
+                        crs_epsg=crs_epsg,
+                        layer_name="train_holdout",
+                    )
+                    print(f"[保存] ホールドアウト学習用 GPKG: {train_gpkg_path}")
+
+                if save_parquet:
+                    # 学習データ側の GeoParquet も保存（geometry 付き）
+                    train_parquet_path = out_dir / f"{base.stem}_train_holdout_{run_id}.parquet"
+                    try:
+                        save_geoparquet_with_points(
+                            train_df,
+                            train_parquet_path,
+                            x_col=x_col,
+                            y_col=y_col,
+                            crs_epsg=crs_epsg,
+                        )
+                        print(f"[保存] ホールドアウト学習用 GeoParquet: {train_parquet_path}")
+                    except Exception as e:
+                        print(
+                            f"[WARN] ホールドアウト学習用 GeoParquet の書き出しに失敗しました: {e}"
+                        )
+
+                if save_parquet:
+                    eval_parquet_path = out_dir / f"{base.stem}_eval_holdout_{run_id}.parquet"
+                    try:
+                        save_geoparquet_with_points(
+                            eval_df,
+                            eval_parquet_path,
+                            x_col=x_col,
+                            y_col=y_col,
+                            crs_epsg=crs_epsg,
+                        )
+                        print(f"[保存] ホールドアウト評価用 GeoParquet: {eval_parquet_path}")
+                    except Exception as e:
+                        print(f"[WARN] ホールドアウト評価用 GeoParquet の書き出しに失敗しました: {e}")
             else:
                 print(
                     "  ⚠ 指定された座標列が df に存在しないため、ホールドアウト評価用 "
-                    "GPKG の出力をスキップします。"
+                    "GPKG / Parquet の出力をスキップします。"
                 )
         else:
             print(
-                "  ⚠ 評価用 GPKG 出力は無効です（座標列が無いか、GPKG 出力オプションが OFF です）。"
+                "  ⚠ 評価用 GPKG / Parquet 出力は無効です（座標列が無いか、ベクタ出力オプションが OFF です）。"
             )
         eval_mode = "holdout"
         eval_info = {
@@ -2069,6 +2323,8 @@ def train_mode(backend: str = "rf"):
         }
         if eval_gpkg_path is not None:
             eval_info["eval_gpkg_path"] = str(eval_gpkg_path)
+        if eval_parquet_path is not None:
+            eval_info["eval_parquet_path"] = str(eval_parquet_path)
 
     # モデル保存パラメータまとめ
     train_params = {

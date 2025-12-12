@@ -159,8 +159,10 @@ def create_config_template(
             # 学習曲線はバッチの主目的なのでデフォルト ON
             "enable_learning_curve": True,
 
-            # 評価結果を GPKG として出力するか
-            "output_gpkg": True,
+            # 評価結果ベクタを出力するか（GPKG / GeoParquet）
+            "output_gpkg": True,  # True の場合はベクタ出力を有効化
+            # ベクタ出力形式: "gpkg" / "geoparquet" / "both"
+            "vector_format": "both",
             # ensure_xy_columns 内の「この列を x,y として使ってよいか」を自動承認するか
             "accept_xy_auto": True,
 
@@ -326,7 +328,7 @@ def patched_train_environment(config: Dict[str, Any], run_output_root: Path):
 
     - load_table_interactive: input_table_path を使って自動読み込み
     - choose_target_and_features: target_col / feature_cols を使って自動選択
-    - ask_yes_no: GPKG 出力・層化・学習曲線・XY 確認などを設定値で自動応答
+    - ask_yes_no / ask_vector_output_format: ベクタ出力・層化・学習曲線・XY 確認などを設定値で自動応答
     - builtins.input: max_rows / val_mode / random_state / n_estimators / XGB パラメータ /
                       Monte Carlo / k-fold の数値を設定値から返す
     """
@@ -334,6 +336,7 @@ def patched_train_environment(config: Dict[str, Any], run_output_root: Path):
     orig_load_table_interactive = rf.load_table_interactive
     orig_choose_target_and_features = rf.choose_target_and_features
     orig_ask_yes_no = rf.ask_yes_no
+    orig_ask_vector_output_format = getattr(rf, "ask_vector_output_format", None)
     orig_input = builtins.input
 
     # -------- load_table_interactive の差し替え --------
@@ -376,8 +379,12 @@ def patched_train_environment(config: Dict[str, Any], run_output_root: Path):
     # -------- ask_yes_no の差し替え --------
     def ask_yes_no_override(prompt: str, default: bool | None = None, *args, **kwargs) -> bool:  # ←変更
         text = str(prompt)
-        # GPKG 出力有無
-        if "GPKG（ポイント）として出力しますか" in text:
+        # 評価結果ベクタ出力有無（GPKG / GeoParquet）
+        if (
+            "評価結果をベクタ（ポイント）として出力しますか" in text
+            or "評価結果を GPKG（ポイント）として出力しますか" in text
+            or "GPKG（ポイント）として出力しますか" in text  # 旧メッセージ互換
+        ):
             return bool(config.get("output_gpkg", False))
         # 層化
         if "層化サンプリング / 層化CV を使いますか" in text:
@@ -390,6 +397,22 @@ def patched_train_environment(config: Dict[str, Any], run_output_root: Path):
             return bool(config.get("accept_xy_auto", True))
         # それ以外は元の挙動
         return orig_ask_yes_no(prompt, default, *args, **kwargs)  # ←変更
+
+    # -------- ask_vector_output_format の差し替え --------
+    def ask_vector_output_format_override(default: str = "both"):
+        """
+        評価結果ベクタの出力形式（GPKG / GeoParquet / 両方）を設定ファイルから決定する。
+        """
+        fmt = str(config.get("vector_format", "")).lower()
+        if fmt not in ("gpkg", "geoparquet", "both"):
+            fmt = default.lower()
+
+        if fmt == "gpkg":
+            return True, False
+        if fmt == "geoparquet":
+            return False, True
+        # "both" その他は両方
+        return True, True
 
     # -------- input の差し替え --------
     def input_override(prompt: str = "") -> str:
@@ -494,12 +517,16 @@ def patched_train_environment(config: Dict[str, Any], run_output_root: Path):
         rf.load_table_interactive = load_table_interactive_override  # type: ignore
         rf.choose_target_and_features = choose_target_and_features_override  # type: ignore
         rf.ask_yes_no = ask_yes_no_override  # type: ignore
+        if orig_ask_vector_output_format is not None:
+            rf.ask_vector_output_format = ask_vector_output_format_override  # type: ignore
         builtins.input = input_override  # type: ignore
         yield
     finally:
         rf.load_table_interactive = orig_load_table_interactive  # type: ignore
         rf.choose_target_and_features = orig_choose_target_and_features  # type: ignore
         rf.ask_yes_no = orig_ask_yes_no  # type: ignore
+        if orig_ask_vector_output_format is not None:
+            rf.ask_vector_output_format = orig_ask_vector_output_format  # type: ignore
         builtins.input = orig_input  # type: ignore
 
 
