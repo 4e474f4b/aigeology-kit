@@ -97,7 +97,22 @@ def create_config_template(
     thin_rate_y: int | None = None,               # ←追加: y の間引き率
     output_epsg: str | None = None,               # ←追加: 保存する座標系
     max_rows: int | None = None,                  # ←追加: 学習＋検証に使う最大行数
-    test_size: float | None = None,              # ←変更: ホールドアウト時のテスト割合
+    # --- train 側で聞いてくる共通設定をテンプレにも反映（←追加） ---
+    random_state: int | None = 42,
+    use_stratify: bool | None = True,
+    enable_learning_curve: bool | None = True,
+    output_gpkg: bool | None = True,
+    vector_format: str | None = "both",   # "gpkg" / "parquet" / "both"
+    accept_xy_auto: bool | None = True,
+    max_depth: int | None = None,
+    # --- XGBoost 用（rf でも入れておく。rf 側は無視される想定） ---
+    learning_rate: float | None = None,
+    subsample: float | None = None,
+    colsample_bytree: float | None = None,
+    # --- 検証法別 ---
+    test_size: float | None = None,       # holdout/mc の test_size（None なら train 側で対話/既定）
+    mc_n_splits: int | None = None,       # Monte Carlo: 繰返し回数（None なら train 側で対話/既定）
+    k_splits: int | None = None,          # k-fold: 分割数（None なら train 側で対話/既定）
 ) -> None:
     """
     CPU/GPU × 検証法パターンに応じたサンプル設定 JSON を生成する。
@@ -120,6 +135,15 @@ def create_config_template(
     if target_col_spec is None or not str(target_col_spec).strip():
         target_col_spec = "LandClass"
     # feature_cols_spec は「未指定なら None」のままにしておく
+
+    # holdout/mc の test_size は train 側の挙動に合わせて既定 0.2
+    if val_mode in (1, 2) and (test_size is None):
+        test_size = 0.2
+    # Monte Carlo / k-fold の既定
+    if mc_n_splits is None:
+        mc_n_splits = 10
+    if k_splits is None:
+        k_splits = 5
 
     for n_est in n_estimators_list:
         run_name = f"{backend}_{val_name}_n{n_est}"
@@ -148,40 +172,52 @@ def create_config_template(
             # 検証法: 1=ホールドアウト, 2=Monte Carlo CV, 3=k-fold CV
             "val_mode": val_mode,
 
-            # ホールドアウト / Monte Carlo のときのテストデータ割合
-            # - None または未指定: train 側の既定値 0.2 を使用
-            # - 0 < test_size <= 0.5 の範囲を推奨（例: 0.1, 0.2, 0.3）  # ←変更
-            "test_size": test_size,
-
-            # 共通パラメータ
-            "random_state": 42,
-            "use_stratify": True,
-            # 学習曲線はバッチの主目的なのでデフォルト ON
-            "enable_learning_curve": True,
-
-            # 評価結果ベクタを出力するか（GPKG / GeoParquet）
-            "output_gpkg": True,  # True の場合はベクタ出力を有効化
-            # ベクタ出力形式: "gpkg" / "geoparquet" / "both"
-            "vector_format": "both",
-            # ensure_xy_columns 内の「この列を x,y として使ってよいか」を自動承認するか
-            "accept_xy_auto": True,
+            "random_state": random_state,
+            "use_stratify": use_stratify,
+            "enable_learning_curve": enable_learning_curve,
+            "output_gpkg": output_gpkg,
+            "vector_format": vector_format,
+            "accept_xy_auto": accept_xy_auto,
 
             # モデルパラメータ
             "n_estimators": int(n_est),
-            "max_depth": None,  # None の場合は空Enter扱い（train_mode側の既定値）
-
+            "max_depth": max_depth,
             # XGBoost 用パラメータ (backend="xgb" のときのみ利用)
-            "learning_rate": 0.1,
-            "subsample": 0.8,
-            "colsample_bytree": 0.8,
+            # 不要時に紛れないよう既定は None（train 側の既定にフォールバック）
+            "learning_rate": learning_rate,
+            "subsample": subsample,
+            "colsample_bytree": colsample_bytree,
 
-            # Monte Carlo 用（val_mode=2 で有効）
-            "mc_n_splits": 10,
-            "mc_test_size": 0.2,
-
-            # k-fold 用（val_mode=3 で有効）
-            "k_splits": 5,
+            # 検証法別（まずはキーを置いておく：最終的に val_mode で None を整理）
+            "test_size": test_size,
+            "mc_n_splits": mc_n_splits,
+            "mc_test_size": test_size if val_mode == 2 else None,
+            "k_splits": k_splits,                   
         }
+
+        # backend=rf のときは XGBoost パラメータを明示的に None（紛れ防止）
+        if backend != "xgb":
+            run_cfg["learning_rate"] = None
+            run_cfg["subsample"] = None
+            run_cfg["colsample_bytree"] = None
+
+        # 検証法別（不要キーは必ず None：混入防止）
+        if val_mode == 1:
+            run_cfg["test_size"] = test_size
+            run_cfg["mc_n_splits"] = None
+            run_cfg["mc_test_size"] = None
+            run_cfg["k_splits"] = None
+        elif val_mode == 2:
+            run_cfg["test_size"] = test_size
+            run_cfg["mc_n_splits"] = mc_n_splits
+            run_cfg["mc_test_size"] = test_size
+            run_cfg["k_splits"] = None
+        elif val_mode == 3:
+            run_cfg["test_size"] = None
+            run_cfg["mc_n_splits"] = None
+            run_cfg["mc_test_size"] = None
+            run_cfg["k_splits"] = k_splits
+
         runs.append(run_cfg)
 
     # ★出力ルートが指定されていない場合は既定値 "./rf_batch_results" を使う  # ←変更
@@ -404,12 +440,12 @@ def patched_train_environment(config: Dict[str, Any], run_output_root: Path):
         評価結果ベクタの出力形式（GPKG / GeoParquet / 両方）を設定ファイルから決定する。
         """
         fmt = str(config.get("vector_format", "")).lower()
-        if fmt not in ("gpkg", "geoparquet", "both"):
+        if fmt not in ("gpkg", "geoparquet", "parquet", "both"):
             fmt = default.lower()
 
         if fmt == "gpkg":
             return True, False
-        if fmt == "geoparquet":
+        if fmt in ("geoparquet", "parquet"):
             return False, True
         # "both" その他は両方
         return True, True
@@ -496,22 +532,17 @@ def patched_train_environment(config: Dict[str, Any], run_output_root: Path):
 
         # Monte Carlo: test_size
         if "テストデータ割合 test_size" in text:
-            v = config.get("mc_test_size")
+            # train 側は test_size を読むので、まず test_size を優先
+            # 互換として mc_test_size が残っていても拾う
+            v = config.get("test_size")
+            if v is None:
+                v = config.get("mc_test_size")
             return "" if v in (None, "", "None") else str(v)
 
         # k-fold: k-分割数
         if "k-分割数（空=5）" in text:
             v = config.get("k_splits")
             return "" if v in (None, "", "None") else str(v)
-
-        # 保存する座標系  # ←追加
-        # 例: "保存する座標系（空=None。例: EPSG:4326 / EPSG:6677）: "
-        if "保存する座標系" in text:
-            v = config.get("output_epsg")
-            return "" if v in (None, "", "None") else str(v)
-
-        # それ以外は元の input にフォールバック（想定外の入力があれば対話的に聞く）
-        return orig_input(prompt)
 
     try:
         rf.load_table_interactive = load_table_interactive_override  # type: ignore
@@ -732,6 +763,104 @@ def interactive_create_config(script_dir: Path) -> None:
     else:
         max_rows = None
 
+    # =========================================================
+    # XGBoost の設問（backend=xgb のときだけ）
+    # =========================================================
+    learning_rate: float | None = None
+    subsample: float | None = None
+    colsample_bytree: float | None = None
+    if backend == "xgb":
+        lr = input("XGBoost learning_rate（空=0.1）: ").strip()
+        if lr:
+            try:
+                learning_rate = float(lr)
+            except ValueError:
+                print("[WARN] learning_rate が数値でないため None（既定）にします。")
+                learning_rate = None
+
+        ss = input("XGBoost subsample（空=0.8）: ").strip()
+        if ss:
+            try:
+                subsample = float(ss)
+            except ValueError:
+                print("[WARN] subsample が数値でないため None（既定）にします。")
+                subsample = None
+
+        cs = input("XGBoost colsample_bytree（空=0.8）: ").strip()
+        if cs:
+            try:
+                colsample_bytree = float(cs)
+            except ValueError:
+                print("[WARN] colsample_bytree が数値でないため None（既定）にします。")
+                colsample_bytree = None
+
+    # --- train 側で聞いてくる「共通設定」をここでも入力（←追加） ---
+    rs_in = input("random_state（空=42）: ").strip()
+    try:
+        random_state = int(rs_in) if rs_in else 42
+    except ValueError:
+        print("[WARN] random_state が整数でないため 42 を使います。")
+        random_state = 42
+
+    strat_in = input("層化サンプリング / 層化CV を使いますか？ [Y/n]: ").strip().lower()
+    use_stratify = (strat_in != "n")
+
+    lc_in = input("学習曲線（Learning Curve）を有効にしますか？ [Y/n]: ").strip().lower()
+    enable_learning_curve = (lc_in != "n")
+
+    outvec_in = input("評価結果をベクタ（ポイント）として出力しますか？ [y/N]: ").strip().lower()
+    output_gpkg = (outvec_in == "y")
+
+    vector_format = "both"
+    accept_xy_auto = True
+    if output_gpkg:
+        print("[ベクタ出力形式の選択]")
+        print("  1) GPKG のみ")
+        print("  2) GeoParquet のみ（.parquet）")
+        print("  3) GPKG + GeoParquet の両方")
+        vf = input("番号を選択してください [1-3]（空=3）: ").strip() or "3"        
+        vector_format = {"1": "gpkg", "2": "geoparquet", "3": "both"}.get(vf, "both")
+
+        xy_in = input("x/y 列は自動検出して採用しますか？ [Y/n]: ").strip().lower()
+        accept_xy_auto = (xy_in != "n")
+
+    # 代表値（sweep するなら設定ファイルを手編集で複数 runs にしてもよい）
+    md_in = input("max_depth（空=None=制限なし）: ").strip()
+    try:
+        max_depth = int(md_in) if md_in else None
+    except ValueError:
+        print("[WARN] max_depth が整数でないため None にします。")
+        max_depth = None
+
+    # 検証法別（val_mode ごとに必要な値だけ聞く。空入力は None）
+    test_size = None
+    mc_n_splits = None
+    k_splits = None
+    if val_mode in (1, 2):
+        ts_in = input("テストデータ割合 test_size（0〜0.5 程度, 空=None=train 側既定）: ").strip()
+        if ts_in:
+            try:
+                test_size = float(ts_in)
+            except ValueError:
+                print("[WARN] test_size が数値でないため None（train 側既定）にします。")
+                test_size = None
+    if val_mode == 2:
+        mc_in = input("繰り返し回数 n_splits（空=None=train 側既定）: ").strip()
+        if mc_in:
+            try:
+                mc_n_splits = int(mc_in)
+            except ValueError:
+                print("[WARN] n_splits が整数でないため None（train 側既定）にします。")
+                mc_n_splits = None
+    if val_mode == 3:
+        k_in = input("k-分割数（空=None=train 側既定）: ").strip()
+        if k_in:
+            try:
+                k_splits = int(k_in)
+            except ValueError:
+                print("[WARN] k が整数でないため None（train 側既定）にします。")
+                k_splits = None
+
     create_config_template(
         target_path,
         backend=backend,
@@ -744,6 +873,21 @@ def interactive_create_config(script_dir: Path) -> None:
         thin_rate_y=thin_rate_y,             # ←追加
         output_epsg=output_epsg,             # ←追加
         max_rows=max_rows,                   # ←追加
+        random_state=random_state,
+        use_stratify=use_stratify,
+        enable_learning_curve=enable_learning_curve,
+        output_gpkg=output_gpkg,
+        vector_format=vector_format,
+        accept_xy_auto=accept_xy_auto,
+        max_depth=max_depth,
+        # 検証法別（val_mode ごとに必要な値のみ設定。不要は None）
+        test_size=test_size,
+        mc_n_splits=mc_n_splits,
+        k_splits=k_splits,
+        # XGBoost（backend=xgb のときのみ値が入り、それ以外は None）
+        learning_rate=learning_rate,
+        subsample=subsample,
+        colsample_bytree=colsample_bytree,        
     )
 
 

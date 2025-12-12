@@ -1657,15 +1657,15 @@ def train_mode(backend: str = "rf"):
 
                     if save_gpkg:
                         eval_gpkg_path = out_dir / f"{base.stem}_eval_mc_last_{run_id}.gpkg"
-                    save_gpkg_with_points(
-                        eval_df,
-                        eval_gpkg_path,
-                        x_col=x_col,
-                        y_col=y_col,
-                        crs_epsg=crs_epsg,
-                        layer_name="eval_mc_last",
-                    )
-                    print(f"[保存] Monte Carlo 最終分割 評価 GPKG: {eval_gpkg_path}")
+                        save_gpkg_with_points(
+                            eval_df,
+                            eval_gpkg_path,
+                            x_col=x_col,
+                            y_col=y_col,
+                            crs_epsg=crs_epsg,
+                            layer_name="eval_mc_last",
+                        )
+                        print(f"[保存] Monte Carlo 最終分割 評価 GPKG: {eval_gpkg_path}")
 
                     # --- 学習データ側（train）の GPKG / GeoParquet も出力 ---
                     train_df = df.iloc[idx_train_cv].copy()
