@@ -1264,73 +1264,105 @@ def make_training_data_mode():
 
     # 属性を付与するポリゴンGPKG（任意）
     poly_for_attr: Path | None = None
-    poly_attr_cols: list[str] | None = None
+    poly_attr_paths: list[Path] = []
     selected_poly_attr_cols: list[str] | None = None
+
     if polygons:
         ans = input("ポリゴンGPKGの属性値も特徴量/ラベルとして付与しますか？ [y/N]: ").strip().lower() or "n"
         if ans.startswith("y"):
-            p_idx = input(
-                "  使用するポリゴンGPKGの番号 "
-                "（例: 0 または P0。null/空=使用しない）: "
+            p_raw = input(
+                "  使用するポリゴンGPKGの番号 （例: 0,1 または P0,P1。空=全て。null/none=使用しない）: "
             ).strip()
 
-            # null / none / 空文字 → 使用しない
-            if not p_idx or p_idx.lower() in {"null", "none"}:
-                print("  ポリゴン属性は使用しません。")
+            if p_raw.lower() in {"null", "none"}:
+                poly_for_attr = None
+                poly_attr_paths = []
             else:
-                m = re.fullmatch(r"[Pp](\d+)", p_idx)
-                if m:
-                    p_idx = m.group(1)
-                try:
-                    p_i = int(p_idx)
-                except ValueError:
-                    print("  ⚠ 番号が不正なのでポリゴン属性は使用しません。")
+                # 空=全て
+                if p_raw == "":
+                    p_list = list(range(len(polygons)))
                 else:
-                    if 0 <= p_i < len(polygons):
-                        poly_for_attr = polygons[p_i]
-                        # ここで属性列の一覧表示と選択も行う
-                        try:
-                            import geopandas as gpd
-                        except ImportError:
-                            print("  ⚠ geopandas がインポートできないため、ポリゴン属性は付与しません。")
-                            poly_for_attr = None
-                        else:
-                            try:
-                                poly_gdf_preview = gpd.read_file(poly_for_attr)
-                            except Exception as e:
-                                print(f"  ⚠ ポリゴン属性の列情報を取得できませんでした: {e}")
-                                poly_for_attr = None
-                            else:
-                                attr_cols = [c for c in poly_gdf_preview.columns if c.lower() not in {"geometry"}]
-                                if not attr_cols:
-                                    print("  ⚠ 利用可能な属性列がありません（geometry のみ）。")
-                                    poly_attr_cols = None
-                                else:
-                                    print(f"\\n[INFO] ポリゴン属性の付与: {poly_for_attr}")
-                                    print("  利用可能な属性列:")
-                                    for i, c in enumerate(attr_cols):
-                                        print(f"    [{i:02d}] {c}")
-                                    sel = input("  付与する属性列の番号（カンマ区切り、空=全て）: ").strip()
-                                    if sel:
-                                        idxs: list[int] = []
-                                        for tok in sel.split(","):
-                                            tok = tok.strip()
-                                            if not tok:
-                                                continue
-                                            try:
-                                                idxs.append(int(tok))
-                                            except ValueError:
-                                                print(f"    ⚠ 無視します: '{tok}'")
-                                        selected_poly_attr_cols = [
-                                            attr_cols[i] for i in idxs if 0 <= i < len(attr_cols)
-                                        ]
-                                        if not selected_poly_attr_cols:
-                                            print("  ⚠ 有効な番号が指定されなかったため、全ての属性列を使用します。")
-                                            selected_poly_attr_cols = attr_cols
-                                    else:
-                                        selected_poly_attr_cols = attr_cols
+                    toks = [t.strip() for t in re.split(r"[,:;\s]+", p_raw) if t.strip()]
+                    p_list: list[int] = []
+                    ok = True
+                    for t in toks:
+                        if t.upper().startswith("P"):
+                            t = t[1:]
+                        if not t.isdigit():
+                            ok = False
+                            break
+                        idx = int(t)  # "00" -> 0
+                        if not (0 <= idx < len(polygons)):
+                            ok = False
+                            break
+                        p_list.append(idx)
+
+                    if not ok:
+                        print("  ⚠ 番号が不正なのでポリゴン属性は使用しません。")
+                        poly_for_attr = None
+                        poly_attr_paths = []
+                        p_list = []
+
+                if p_list:
+                    p_list = sorted(set(p_list))
+                    poly_attr_paths = [polygons[i] for i in p_list]
+                    poly_for_attr = poly_attr_paths[0]
+
+                    # ここで属性列の一覧表示と選択（複数 gpkg は結合して列一覧を作る）
+                    try:
+                        import geopandas as gpd
+                    except ImportError:
+                        print("  ⚠ geopandas がインポートできないため、ポリゴン属性は付与しません。")
+                        poly_for_attr = None
+                        poly_attr_paths = []
                     else:
-                        print("  ⚠ 範囲外の番号なのでポリゴン属性は使用しません。")
+                        try:
+                            gdfs = []
+                            base_crs = None
+                            for _p in poly_attr_paths:
+                                g = gpd.read_file(_p)
+                                if base_crs is None and g.crs is not None:
+                                    base_crs = g.crs
+                                if base_crs is not None and g.crs is not None and g.crs != base_crs:
+                                    g = g.to_crs(base_crs)
+                                gdfs.append(g)
+
+                            poly_gdf_preview = gpd.GeoDataFrame(
+                                pd.concat(gdfs, ignore_index=True),
+                                crs=base_crs,
+                            )
+                        except Exception as e:
+                            print(f"  ⚠ ポリゴン属性の列情報を取得できませんでした: {e}")
+                            poly_for_attr = None
+                            poly_attr_paths = []
+                        else:
+                            attr_cols = [c for c in poly_gdf_preview.columns if c.lower() != "geometry"]
+                            if not attr_cols:
+                                print("  ⚠ 利用可能な属性列がありません（geometry のみ）。")
+                            else:
+                                print(f"\n[INFO] ポリゴン属性の付与（結合プレビュー）: {len(poly_attr_paths)} 件")
+                                print("  利用可能な属性列:")
+                                for i, c in enumerate(attr_cols):
+                                    print(f"    [{i:02d}] {c}")
+
+                                sel = input("  付与する属性列の番号（カンマ区切り、空=全て）: ").strip()
+                                if sel:
+                                    idxs: list[int] = []
+                                    for tok in sel.split(","):
+                                        tok = tok.strip()
+                                        if not tok:
+                                            continue
+                                        try:
+                                            idxs.append(int(tok))
+                                        except ValueError:
+                                            print(f"    ⚠ 無視します: '{tok}'")
+
+                                    selected_poly_attr_cols = [attr_cols[i] for i in idxs if 0 <= i < len(attr_cols)]
+                                    if not selected_poly_attr_cols:
+                                        print("  ⚠ 有効な番号が指定されなかったため、全ての属性列を使用します。")
+                                        selected_poly_attr_cols = attr_cols
+                                else:
+                                    selected_poly_attr_cols = attr_cols
         else:
             print("  ポリゴン属性は使用しません。")
 
@@ -1365,8 +1397,47 @@ def make_training_data_mode():
         ext_path_in = input("  範囲用GPKGのフルパス（空=上の一覧/属性用から選択）: ").strip()
 
         if ext_path_in:
-            # 任意パスを直接指定
-            poly_for_extent = strip_quotes(ext_path_in)
+            s = strip_quotes(ext_path_in).strip()
+
+            # 入力が P0 / P00 / 0 のような「番号」なら、polygons から実パスへ解決する
+            m = re.fullmatch(r"[Pp](\d+)", s)
+            if m:
+                s_idx = m.group(1)  # "00" -> "00"
+            else:
+                s_idx = s
+
+            if s_idx.isdigit():
+                p_i = int(s_idx)
+                if 0 <= p_i < len(polygons):
+                    poly_for_extent = polygons[p_i]
+                else:
+                    print("  ⚠ 番号が範囲外です。手動入力に切り替えます。")
+                    try:
+                        xmin = float(input("xmin: ").strip())
+                        ymin = float(input("ymin: ").strip())
+                        xmax = float(input("xmax: ").strip())
+                        ymax = float(input("ymax: ").strip())
+                    except Exception:
+                        print("数値として解釈できませんでした。終了します。")
+                        return
+                    poly_for_extent = None
+            else:
+                # 文字列がパスならそのまま使う（存在チェック）
+                if os.path.exists(s):
+                    poly_for_extent = s
+                else:
+                    print(f"  ⚠ 指定パスが存在しません: {s}")
+                    print("  手動入力に切り替えます。")
+                    try:
+                        xmin = float(input("xmin: ").strip())
+                        ymin = float(input("ymin: ").strip())
+                        xmax = float(input("xmax: ").strip())
+                        ymax = float(input("ymax: ").strip())
+                    except Exception:
+                        print("数値として解釈できませんでした。終了します。")
+                        return
+                    poly_for_extent = None
+
         else:
             # 何も指定されなかった場合は、既存情報から決める
             if not polygons and not poly_for_attr:
