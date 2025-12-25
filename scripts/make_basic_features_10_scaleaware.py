@@ -103,6 +103,21 @@ def _r_to_k_list(relief_r_list, px):
     return k_list
 
 
+def _dedupe_preserve_order(items, key=None):
+    """順序を維持して重複を除去する（表示用・上書き防止用）。"""
+    if key is None:
+        key = lambda x: x
+    seen = set()
+    out = []
+    for x in items:
+        k = key(x)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(x)
+    return out
+
+
 def ask_int(prompt, default):
     while True:
         s = input(f"{prompt} [{default}]: ").strip()
@@ -125,12 +140,14 @@ def ask_float_list(prompt, default_list):
         if not s:
             return list(default_list)
         try:
-            vals = [float(x) for x in s.split(",") if x.strip() != ""]
+            # 例: "10.0,20,30]" のような入力を許容（コピペ対策）
+            s2 = s.strip().strip("[]")
+            vals = [float(x.strip()) for x in s2.split(",") if x.strip() != ""]
             if not vals:
                 raise ValueError
             return vals
         except ValueError:
-            print("  カンマ区切りの数値で入力してください（例: 2,5,10）。")
+            print("  カンマ区切りの数値で入力してください（例: 10,20,30）。")
 
 
 def ask_int_list(prompt, default_list):
@@ -733,15 +750,17 @@ def main():
         [30.0, 50.0, 90.0],
     )
 
-    k_list = _r_to_k_list(relief_r_list, px)
+    # 入力Rは保持（ファイル名の重複回避・「入力8本=8スケール」担保のため）
+    relief_r_in_list = list(relief_r_list)
+    k_list = _r_to_k_list(relief_r_in_list, px)
     adopted_r_list = [float(k) * float(px) for k in k_list]
     
     print("\n  → 入力Rに対して採用される実効R（=k×px）:")
-    for Rin, k, Radopt in zip(relief_r_list, k_list, adopted_r_list):
+    for Rin, k, Radopt in zip(relief_r_in_list, k_list, adopted_r_list):
         print(f"    R_in={Rin:.3f} m → k={k}（{k}×{k}窓） → R_adopt={Radopt:.3f} m")
 
-    # 以降は「採用実効R（=k×px）」で統一
-    relief_r_list = adopted_r_list
+    # 計算は k で行う（Rを上書きしない）
+    # relief_r_list = adopted_r_list  # ←削除
 
     # R_open_match の求め方（外接円 / 面積等価円 / 内接円）を選択
     print("  1: 外接円（正方形窓の外接円） R_open = √2 × R_eff")
@@ -769,15 +788,14 @@ def main():
     r_open_match_list = []
     # N_R（=比高/標準偏差のスケール数）
     # ※この後の平滑化 r_px_smooth 自動提案に使う
-    for R in relief_r_list:
-        k = _winpix_from_meters(R, px, min_win=3, odd=True)
+    for Rin, k in zip(relief_r_in_list, k_list):
         win_pix_list.append(k)
         R_eff = ((k - 1) / 2.0) * px
         r_eff_list.append(R_eff)
         R_open_match = coeff * R_eff
         r_open_match_list.append(R_open_match)
         print(
-            f"  R={R:.3f}m → k={k} (窓サイズ {k}×{k}), "
+            f"  R_in={Rin:.3f}m → k={k} (窓サイズ {k}×{k}), "
             f"R_eff≒{R_eff:.3f}m, R_open_match≒{R_open_match:.3f}m"
         )
 
@@ -1000,6 +1018,13 @@ def main():
             for p, R in zip(px_list_sm, smooth_r_list):
                 print(f"    {p} px → R_smooth ≒ {R:.3f} m")
 
+        # 重複除去（順序維持）：同一R_smoothは同一出力名になり上書きされるため除去
+        if smooth_r_list:
+            _orig = list(smooth_r_list)
+            smooth_r_list = _dedupe_preserve_order(smooth_r_list, key=lambda v: round(float(v), 6))
+            if len(smooth_r_list) != len(_orig):
+                print(f"[INFO] R_smooth の重複を除去しました: {smooth_r_list}")
+
         print("\n---情報--- スムージング版の勾配/曲率は、指定した R_smooth を")
         if smooth_filter_type == "box":
             print("       「中心から R_smooth[m] 程度の範囲を移動平均した DEM」から計算します。")
@@ -1024,20 +1049,18 @@ def main():
             dst.write(arr, 1)
 
     # --- 比高 / 標準偏差（マルチスケール） ---
-    for R_in in relief_r_list:
-        # R_in[m] から窓サイズ k と有効半径 R_eff[m] を再計算
-        win_pix = _winpix_from_meters(R_in, px, min_win=3, odd=True)
+    for Rin, win_pix in zip(relief_r_in_list, k_list):
         R_eff = ((win_pix - 1) / 2.0) * px
 
         print(
-            f"\n  > 比高 / 標準偏差: 入力R={R_in:.3f}m, "
+            f"\n  > 比高 / 標準偏差: 入力R={Rin:.3f}m, "
             f"k={win_pix}, 有効半径R_eff≒{R_eff:.3f}m ..."
         )
 
         rel = local_relief(dem, win_pix)
         # 外縁マスクは global_mask_win で他指標と共通化
         rel_m = _apply_valid_mask(rel, global_mask_win)
-        tag = f"r{int(round(R_eff))}m"   # ファイル名は有効半径ベース
+        tag = f"rin{int(round(Rin))}m_k{win_pix}_reff{int(round(R_eff))}m"
         write_feature(f"{stem}_relief_{tag}.tif", rel_m)
 
         std = local_stddev(dem, win_pix)
