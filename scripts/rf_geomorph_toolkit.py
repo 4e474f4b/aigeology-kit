@@ -661,7 +661,129 @@ META_DEFAULT  = "rf_meta.json"
 
 
 def strip_quotes(s: str) -> str:
-    return s.strip().strip('"').strip("'")
+    """
+    入力文字列の前後の空白を除去し、両端が同種のクォートで囲まれている場合のみ外す。
+    例:
+      '"C:\\path"' -> 'C:\\path'
+      "'C:\\path'" -> 'C:\\path'
+      "C:\\path"   -> 'C:\\path'
+    """
+    s = s.strip()
+    if len(s) >= 2 and ((s[0] == s[-1]) and s[0] in ("'", '"')):
+        return s[1:-1]
+    return s
+
+
+
+def resolve_windows_lnk(path: "Path | str") -> "Path | None":
+    """
+    Windows の .lnk を実体パスへ解決する。
+
+    優先順位:
+      1) pywin32 (win32com) が利用できる場合
+      2) PowerShell + WScript.Shell (Windows 標準 COM) による解決
+
+    失敗したら None を返す。
+    """
+    from pathlib import Path
+
+    p = Path(path)
+    if p.suffix.lower() != ".lnk":
+        return p
+    if os.name != "nt":
+        return None
+
+    # 1) pywin32 がある場合
+    try:
+        from win32com.client import Dispatch  # type: ignore
+        shell = Dispatch("WScript.Shell")
+        sc = shell.CreateShortCut(str(p))
+        tgt = (getattr(sc, "Targetpath", "") or "").strip()
+        if tgt:
+            pt = Path(tgt)
+            return pt if pt.exists() else None
+    except Exception:
+        pass
+
+    # 2) PowerShell で解決（pywin32 不要）
+    try:
+        import subprocess
+        lnk = str(p).replace("'", "''")  # PowerShell 文字列用
+        cmd = [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            f"(New-Object -ComObject WScript.Shell).CreateShortcut('{lnk}').TargetPath",
+        ]
+        cp = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        tgt = (cp.stdout or "").strip()
+        if not tgt:
+            return None
+        pt = Path(tgt)
+        return pt if pt.exists() else None
+    except Exception:
+        return None
+
+
+def _collect_inputs_from_root(root_dir: str) -> tuple[list[Path], list[Path]]:
+    """
+    root_dir 配下の rasters / polygons を収集。
+    .lnk は以下をサポート:
+      - ファイルショートカット: 実体が tif/img なら rasters に追加
+      - フォルダショートカット: 実体フォルダ配下も再帰走査
+    """
+    raster_exts = (".tif", ".tiff", ".img")
+    rasters: list[Path] = []
+    polygons: list[Path] = []
+
+    roots: list[Path] = [Path(root_dir)]
+    seen_root: set[str] = set()
+
+    while roots:
+        rd = roots.pop()
+        k = str(rd)
+        if k in seen_root:
+            continue
+        seen_root.add(k)
+        if not rd.exists():
+            continue
+
+        for p in rd.rglob("*"):
+            if p.is_dir():
+                continue
+            low = p.suffix.lower()
+            if low in raster_exts:
+                rasters.append(p)
+            elif low == ".gpkg":
+                polygons.append(p)
+            elif low == ".lnk":
+                tgt = resolve_windows_lnk(p)
+                if tgt is None or not tgt.exists():
+                    continue
+                if tgt.is_dir():
+                    roots.append(tgt)
+                else:
+                    if tgt.suffix.lower() in raster_exts:
+                        rasters.append(tgt)
+                    elif tgt.suffix.lower() == ".gpkg":
+                        polygons.append(tgt)
+
+    # 重複除去
+    def _uniq(ps: list[Path]) -> list[Path]:
+        seen: set[str] = set()
+        out: list[Path] = []
+        for x in ps:
+            sx = str(x)
+            if sx in seen:
+                continue
+            seen.add(sx)
+            out.append(x)
+        return out
+
+    return _uniq(rasters), _uniq(polygons)
+
 
 def list_columns(df: pd.DataFrame, title="カラム一覧"):
     print(f"\n=== {title} ===")
@@ -1202,18 +1324,20 @@ def make_training_data_mode():
         print(f"[INFO] 拡張子 {base_out_path.suffix} は無視し、ベースパスとして扱います。")
         base_out_path = base_out_path.with_suffix("")
 
-    # --- ラスター/ポリゴンの探索 ---
-    raster_exts = (".tif", ".tiff", ".img")
-    rasters: list[Path] = []
-    polygons: list[Path] = []
-    for p in Path(root_dir).rglob("*"):
-        if not p.is_file():
-            continue
-        low = p.suffix.lower()
-        if low in raster_exts:
-            rasters.append(p)
-        elif low == ".gpkg":
-            polygons.append(p)
+    # --- ラスター/ポリゴンの探索（.lnk フォルダも追跡） ---
+    rasters, polygons = _collect_inputs_from_root(root_dir)
+
+    # 重複除去（同一実体を複数リンクしているケース）
+    if rasters:
+        seen = set()
+        uniq = []
+        for rp in rasters:
+            key = str(rp)
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(rp)
+        rasters = uniq
 
     if not rasters and not polygons:
         print("ラスター(.tif 等) もポリゴン(.gpkg) も見つかりませんでした。終了します。")
@@ -1759,61 +1883,85 @@ def make_training_data_mode():
         df = pd.concat([df, feat_df], axis=1)
         df = df.copy()  # fragmentation を解消
 
-    # ポリゴン属性の付与（任意）
-    if poly_for_attr is not None:
-        print("\n[INFO] ポリゴン属性の付与:", poly_for_attr)
+    # ポリゴン属性の付与（任意）: 選択された全GPKGを順次付与する
+    if poly_attr_paths:
         import geopandas as gpd
         from shapely.geometry import Point as ShapelyPoint
 
-        poly_gdf = gpd.read_file(poly_for_attr)
+        # サンプル点を GeoDataFrame に変換（1回だけ作る）
+        df_points = df[["x", "y"]].copy()
+        df_points = df_points.dropna(subset=["x", "y"])
+        pts_geom = [ShapelyPoint(xy) for xy in zip(df_points["x"], df_points["y"])]
 
-        # --- CRS の合わせ込み ---
-        # ラスターが 1 枚以上あれば base_crs に揃える。
-        # ラスターが無い場合は、ポリゴン側の CRS を基準にする。
+        # CRS は「ラスターがあれば base_crs」「なければ最初のポリゴンCRS」
         if base_crs is None:
-            base_crs = poly_gdf.crs
-        else:
-            if poly_gdf.crs is None:
-                poly_gdf.set_crs(base_crs, inplace=True)
-            elif poly_gdf.crs != base_crs:
-                poly_gdf = poly_gdf.to_crs(base_crs)
+            try:
+                _tmp = gpd.read_file(poly_attr_paths[0])
+                base_crs = _tmp.crs
+            except Exception:
+                base_crs = None
 
-        # 利用する属性列（事前に選択された列を優先）
-        attr_candidates = [c for c in poly_gdf.columns if c.lower() not in {"geometry"}]
-        if not attr_candidates:
-            print("  ⚠ 利用可能な属性列がありません（geometry のみ）。ポリゴン属性の付与はスキップします。")
-        else:
+        pts_gdf = gpd.GeoDataFrame(df_points, geometry=pts_geom, crs=base_crs)
+
+        used_cols: set[str] = set(df.columns)
+
+        for poly_path in poly_attr_paths:
+            print("\n[INFO] ポリゴン属性の付与:", poly_path)
+            poly_gdf = gpd.read_file(poly_path)
+
+            # CRS合わせ
+            if base_crs is None:
+                base_crs = poly_gdf.crs
+                pts_gdf = pts_gdf.set_crs(base_crs, allow_override=True)
+            else:
+                if poly_gdf.crs is None:
+                    poly_gdf = poly_gdf.set_crs(base_crs, allow_override=True)
+                elif poly_gdf.crs != base_crs:
+                    poly_gdf = poly_gdf.to_crs(base_crs)
+
+            # 属性列選択
+            attr_candidates = [c for c in poly_gdf.columns if c.lower() != "geometry"]
+            if not attr_candidates:
+                print("  ⚠ 利用可能な属性列がありません（geometry のみ）。スキップします。")
+                continue
+
             if selected_poly_attr_cols:
                 attr_cols = [c for c in selected_poly_attr_cols if c in attr_candidates]
                 if not attr_cols:
-                    print("  ⚠ 事前に選択された属性列がポリゴンに存在しません。全ての属性列を使用します。")
                     attr_cols = attr_candidates
             else:
                 attr_cols = attr_candidates
 
             print("  使用する属性列:", ", ".join(attr_cols))
 
-            # サンプル点を GeoDataFrame に変換
-            df_points = df[["x", "y"]].copy()
-            df_points = df_points.dropna(subset=["x", "y"])
-            pts_geom = [ShapelyPoint(xy) for xy in zip(df_points["x"], df_points["y"])]
-            pts_gdf = gpd.GeoDataFrame(df_points, geometry=pts_geom, crs=base_crs)
-
-            # sjoin でポリゴン属性を付与
             joined = gpd.sjoin(
                 pts_gdf,
                 poly_gdf[attr_cols + ["geometry"]],
                 how="left",
                 predicate="intersects",
             )
-            drop_cols = [c for c in joined.columns if c in ("index_right",)]
-            joined = joined.drop(columns=drop_cols)
+            if "index_right" in joined.columns:
+                joined = joined.drop(columns=["index_right"])
             if "geometry" in joined.columns:
                 joined = joined.drop(columns=["geometry"])
-        # 元の特徴量テーブル df（x, y + ラスター特徴量）に
-        # ポリゴン属性をマージする（x, y はグリッドで一意）
-        df = df.merge(joined, on=["x", "y"], how="left")
-        print(f"  → ポリゴン属性を付与しました（列数: {len(attr_cols)}）")
+
+            # 列名衝突回避（既存列と同名なら prefix を付ける）
+            prefix = Path(poly_path).stem + "__"
+            rename_map = {}
+            for c in joined.columns:
+                if c in ("x", "y"):
+                    continue
+                if c in used_cols:
+                    rename_map[c] = prefix + c
+            if rename_map:
+                joined = joined.rename(columns=rename_map)
+
+            # merge
+            df = df.merge(joined, on=["x", "y"], how="left")
+            used_cols = set(df.columns)
+
+            added = [c for c in joined.columns if c not in ("x", "y")]
+            print(f"  → ポリゴン属性を付与しました（追加列数: {len(added)}）")
 
     # --- 出力 ---
     print("\n[出力]")
