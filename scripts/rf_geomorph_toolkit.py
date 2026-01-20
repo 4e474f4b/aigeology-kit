@@ -117,6 +117,7 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
+import collections
 
 from sklearn.model_selection import (
     train_test_split,
@@ -128,7 +129,7 @@ from sklearn.model_selection import (
     cross_validate,
     cross_val_predict,
 )
-from sklearn.base import clone
+from sklearn.base import clone, BaseEstimator, ClassifierMixin
 from sklearn.metrics import (
     confusion_matrix,
     classification_report,
@@ -139,7 +140,7 @@ from sklearn.metrics import (
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
-from sklearn.base import clone
+# (duplicate import removed)
 from sklearn.preprocessing import LabelEncoder
 import joblib
 
@@ -674,6 +675,100 @@ def strip_quotes(s: str) -> str:
     return s
 
 
+def _undersample_xy(
+    X: np.ndarray,
+    y: np.ndarray,
+    target_n: int | None,
+    random_state: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """各クラスを同数に揃える（ランダム・アンダーサンプリング）。
+
+    - target_n が None の場合: 最小クラス数に合わせる
+    - target_n 指定ありの場合: min(target_n, 最小クラス数) に丸める
+    """
+    y = np.asarray(y)
+    X = np.asarray(X)
+
+    classes, counts = np.unique(y, return_counts=True)
+    if len(classes) == 0:
+        return X, y
+    min_n = int(counts.min())
+
+    if target_n is None:
+        n = min_n
+    else:
+        n = int(target_n)
+        n = min(n, min_n)
+        if n <= 0:
+            n = min_n
+
+    rng = np.random.default_rng(int(random_state))
+    idx_keep: list[int] = []
+    for c in classes:
+        idx_c = np.where(y == c)[0]
+        if len(idx_c) <= n:
+            idx_keep.extend(idx_c.tolist())
+        else:
+            picked = rng.choice(idx_c, size=n, replace=False)
+            idx_keep.extend(picked.tolist())
+
+    idx_keep = np.array(idx_keep, dtype=int)
+    rng.shuffle(idx_keep)
+    return X[idx_keep], y[idx_keep]
+
+
+class UnderSampledClassifier(BaseEstimator, ClassifierMixin):
+    """fit 時に train 側だけを同数に揃えるための薄いラッパ。"""
+
+    def __init__(self, estimator, target_n: int | None = None, random_state: int = 42):
+        self.estimator = estimator
+        self.target_n = target_n
+        self.random_state = random_state
+
+    def fit(self, X, y):
+        # サンプリング前後の件数を記録（外部ログ出力用）
+        y_arr = np.asarray(y)
+        try:
+            y_list = y_arr.ravel().tolist()
+        except Exception:
+            y_list = list(y_arr)
+        orig_counts = collections.Counter(y_list)
+
+        X_u, y_u = _undersample_xy(
+            np.asarray(X),
+            np.asarray(y),
+            target_n=self.target_n,
+            random_state=self.random_state,
+        )
+        try:
+            y_u_list = np.asarray(y_u).ravel().tolist()
+        except Exception:
+            y_u_list = list(np.asarray(y_u))
+        samp_counts = collections.Counter(y_u_list)
+        self.undersample_info_ = {
+            "target_n": self.target_n,
+            "random_state": self.random_state,
+            "original_total": int(len(y_list)),
+            "sampled_total": int(len(y_u_list)),
+            "original_counts": dict(orig_counts),
+            "sampled_counts": dict(samp_counts),
+        }
+        self.estimator_ = clone(self.estimator)
+        self.estimator_.fit(X_u, y_u)
+        return self
+
+    def predict(self, X):
+        return self.estimator_.predict(X)
+
+    def predict_proba(self, X):
+        if hasattr(self.estimator_, "predict_proba"):
+            return self.estimator_.predict_proba(X)
+        raise AttributeError("Wrapped estimator does not support predict_proba")
+
+    def score(self, X, y):
+        return self.estimator_.score(X, y)
+
+ 
 
 def resolve_windows_lnk(path: "Path | str") -> "Path | None":
     """
@@ -2316,6 +2411,7 @@ def train_mode(backend: str = "rf"):
             ("rf", rf),
         ])
 
+
     # -------------------------------
     # 実験ID (run_id) と出力ディレクトリ
     # -------------------------------
@@ -2330,11 +2426,86 @@ def train_mode(backend: str = "rf"):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # -------------------------------
+    # モデル出力ディレクトリ確定
+    # -------------------------------
+    run_name = f"{base_name}_{backend}_{run_id}"
+
+    model_dir = Path(model_root) / run_name
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    # -------------------------------
+    # アンダーサンプリング（train 側を各クラス同数に揃える）
+    # -------------------------------
+    use_undersample = ask_yes_no(
+        "\n[学習オプション] train側をアンダーサンプリング（各クラス同数）しますか？",
+        default=False,
+    )
+
+    undersample_csv_path = model_dir / f"rf_undersample_info_{run_id}.csv"
+    undersample_target_n: int | None = None
+    apply_undersample_to_final_fit = False
+
+    if use_undersample:
+        import collections
+        counts_all = collections.Counter(y.tolist() if hasattr(y, "tolist") else list(y))
+        min_all = min(counts_all.values()) if counts_all else None
+        print("\n[INFO] 目的変数のクラス別件数（全体）:")
+        for k_ in sorted(counts_all):
+            print(f"  - {k_}: {counts_all[k_]}")
+        print(f"[INFO] 最小クラス数（全体）: {min_all}")
+
+        n_in = input(f"  → 各クラスの上限件数 target_n（空={min_all}）: ").strip()
+        if n_in:
+            undersample_target_n = int(n_in)
+
+        apply_undersample_to_final_fit = ask_yes_no(
+            "  → 最終保存モデルの fit（全データ再学習）にも同じアンダーサンプリングを適用しますか？",
+            default=False,
+        )
+
+    if use_undersample:
+        # 全体のクラス分布（target_n のデフォルト提示用）
+        import collections
+
+        counts_all = collections.Counter(y.tolist() if hasattr(y, "tolist") else list(y))
+        if counts_all:
+            min_all = min(counts_all.values())
+            print("\n[INFO] 目的変数のクラス別件数（全体）:")
+            for k_ in sorted(counts_all.keys()):
+                print(f"  - {k_}: {counts_all[k_]}")
+            print(f"[INFO] 最小クラス数（全体）: {min_all}")
+        else:
+            min_all = None
+
+        n_in = input(
+            f"  → 各クラスの上限件数 target_n（空={min_all}）: "
+        ).strip()
+        if n_in:
+            try:
+                undersample_target_n = int(n_in)
+            except ValueError:
+                print("  ⚠ 整数変換に失敗したため、空Enter扱いにします。")
+                undersample_target_n = None
+
+        apply_undersample_to_final_fit = ask_yes_no(
+            "  → 最終保存モデルの fit（全データ再学習）にも同じアンダーサンプリングを適用しますか？",
+            default=False,
+        )
+
+    # 以降の学習器（CV では fold ごとに train 側が揃う）
+    estimator_for_fit = (
+        UnderSampledClassifier(pipe, target_n=undersample_target_n, random_state=random_state)
+        if use_undersample
+        else pipe
+    )
+
+    # -------------------------------
     # 検証ロジック
     # -------------------------------
     # 後続のメタ情報作成で必ず参照するので、まずは安全側に初期化しておく
     eval_mode = None
     eval_info = {}
+    trained_model = None  # 最終保存対象（fit 済み）
 
     # ===== Monte Carlo Cross-Validation =====
     if val_mode == "2":
@@ -2400,7 +2571,7 @@ def train_mode(backend: str = "rf"):
         if enable_learning_curve:
             print("\n[Learning Curve] Monte Carlo CV 設定で学習曲線を計算中...")
             _plot_learning_curve(
-                pipe,
+                estimator_for_fit,
                 X,
                 y,
                 cv=cv,
@@ -2416,7 +2587,7 @@ def train_mode(backend: str = "rf"):
             "f1_weighted": "f1_weighted",
         }
         cv_result = cross_validate(
-            pipe, X, y, cv=cv, scoring=scoring,
+            estimator_for_fit, X, y, cv=cv, scoring=scoring,
             n_jobs=-1, return_train_score=False,
         )
 
@@ -2445,10 +2616,10 @@ def train_mode(backend: str = "rf"):
             X_train_cv, X_test_cv = X[idx_train_cv], X[idx_test_cv]
             y_train_cv, y_test_cv = y[idx_train_cv], y[idx_test_cv]
 
-            pipe.fit(X_train_cv, y_train_cv)
-            y_pred_cv = pipe.predict(X_test_cv)
+            estimator_for_fit.fit(X_train_cv, y_train_cv)
+            y_pred_cv = estimator_for_fit.predict(X_test_cv)
             # 学習データ側の予測（train GPKG 用）
-            y_pred_train_cv = pipe.predict(X_train_cv)            
+            y_pred_train_cv = estimator_for_fit.predict(X_train_cv)            
 
             # 混同行列・レポート（最後の分割）
             cm = confusion_matrix(y_test_cv, y_pred_cv)
@@ -2657,7 +2828,13 @@ def train_mode(backend: str = "rf"):
         # Monte Carlo CV では OOF 混同行列は作らず、
         # スコア平均＋最終分割（上で可視化済み）のみとする
         print("\n[最終モデルの学習（全データで再学習）...]")
-        pipe.fit(X, y)
+        final_model = (
+            UnderSampledClassifier(pipe, target_n=undersample_target_n, random_state=random_state)
+            if use_undersample and apply_undersample_to_final_fit
+            else pipe
+        )
+        final_model.fit(X, y)
+        trained_model = final_model
         print("学習完了。")
 
         eval_mode = "montecarlo"
@@ -2724,7 +2901,7 @@ def train_mode(backend: str = "rf"):
         if enable_learning_curve:
             print("\n[Learning Curve] k-fold CV 設定で学習曲線を計算中...")
             _plot_learning_curve(
-                pipe,
+                estimator_for_fit,
                 X,
                 y,
                 cv=cv,
@@ -2741,7 +2918,7 @@ def train_mode(backend: str = "rf"):
             "f1_weighted": "f1_weighted",
         }
         cv_result = cross_validate(
-            pipe, X, y, cv=cv, scoring=scoring,
+            estimator_for_fit, X, y, cv=cv, scoring=scoring,
             n_jobs=-1, return_train_score=False,
         )
 
@@ -2758,7 +2935,7 @@ def train_mode(backend: str = "rf"):
 
         # OOF 予測を使った評価（混同行列・classification_report）
         print("\n[評価（クロスバリデーションの out-of-fold 予測）]")
-        y_oof = cross_val_predict(pipe, X, y, cv=cv, n_jobs=-1)
+        y_oof = cross_val_predict(estimator_for_fit, X, y, cv=cv, n_jobs=-1)
         cm = confusion_matrix(y, y_oof)
         print("混同行列（行: 真, 列: 予測）:")
         print(cm)
@@ -2908,7 +3085,13 @@ def train_mode(backend: str = "rf"):
 
         # 最終モデルは全データでフィット
         print("\n[最終モデルの学習（全データで再学習）...]")
-        pipe.fit(X, y)
+        final_model = (
+            UnderSampledClassifier(pipe, target_n=undersample_target_n, random_state=random_state)
+            if use_undersample and apply_undersample_to_final_fit
+            else pipe
+        )
+        final_model.fit(X, y)
+        trained_model = final_model
         print("学習完了。")
 
         eval_mode = "kfold"
@@ -2966,7 +3149,7 @@ def train_mode(backend: str = "rf"):
                 )
 
             _plot_learning_curve(
-                pipe,
+                estimator_for_fit,
                 X,
                 y,
                 cv=cv_lc,
@@ -2988,13 +3171,42 @@ def train_mode(backend: str = "rf"):
         y_train, y_test = y[idx_train], y[idx_test]
 
         print("\n[学習中...]")
-        pipe.fit(X_train, y_train)
+        estimator_for_fit.fit(X_train, y_train)
+
+        # アンダーサンプリング実行内容（train側）をCSVに追記
+        if isinstance(estimator_for_fit, UnderSampledClassifier) and hasattr(estimator_for_fit, "undersample_info_"):
+            info = estimator_for_fit.undersample_info_
+            orig = info.get("original_counts", {}) or {}
+            samp = info.get("sampled_counts", {}) or {}
+            def _k(v):
+                try:
+                    return int(v)
+                except Exception:
+                    return str(v)
+            keys = sorted(set(orig.keys()) | set(samp.keys()), key=_k)
+            rows = []
+            for k in keys:
+                rows.append({
+                    "stage": "train_fit",
+                    "class": k,
+                    "original_count": int(orig.get(k, 0)),
+                    "sampled_count": int(samp.get(k, 0)),
+                    "target_n": int(info.get("target_n") or -1),
+                    "original_total": int(info.get("original_total") or -1),
+                    "sampled_total": int(info.get("sampled_total") or -1),
+                    "random_state": int(info.get("random_state") or -1),
+                })
+            if rows:
+                df_u = pd.DataFrame(rows)
+                header = not undersample_csv_path.exists()
+                df_u.to_csv(undersample_csv_path, index=False, encoding="utf-8-sig", mode="a", header=header)
+
         print("学習完了。")
 
         # 予測
-        y_pred = pipe.predict(X_test)
+        y_pred = estimator_for_fit.predict(X_test)
         # 学習データ側の予測（train GPKG 用）
-        y_pred_train = pipe.predict(X_train)
+        y_pred_train = estimator_for_fit.predict(X_train)
 
         # 混同行列・レポート
         cm = confusion_matrix(y_test, y_pred)
@@ -3225,6 +3437,45 @@ def train_mode(backend: str = "rf"):
         if 'train_gpkg_path' in locals() and train_gpkg_path is not None:
             eval_info["train_gpkg_path"] = str(train_gpkg_path)
 
+    # 最終保存モデル（全データで再学習）
+    if trained_model is None:
+        print("\n[最終モデルの学習（全データで再学習）...]")
+        final_model = (
+            UnderSampledClassifier(pipe, target_n=undersample_target_n, random_state=random_state)
+            if use_undersample and apply_undersample_to_final_fit
+            else pipe
+        )
+        final_model.fit(X, y)
+        # アンダーサンプリング実行内容（最終fit）をCSVに追記
+        if isinstance(final_model, UnderSampledClassifier) and hasattr(final_model, "undersample_info_"):
+            info = final_model.undersample_info_
+            orig = info.get("original_counts", {}) or {}
+            samp = info.get("sampled_counts", {}) or {}
+            def _k(v):
+                try:
+                    return int(v)
+                except Exception:
+                    return str(v)
+            keys = sorted(set(orig.keys()) | set(samp.keys()), key=_k)
+            rows = []
+            for k in keys:
+                rows.append({
+                    "stage": "final_fit",
+                    "class": k,
+                    "original_count": int(orig.get(k, 0)),
+                    "sampled_count": int(samp.get(k, 0)),
+                    "target_n": int(info.get("target_n") or -1),
+                    "original_total": int(info.get("original_total") or -1),
+                    "sampled_total": int(info.get("sampled_total") or -1),
+                    "random_state": int(info.get("random_state") or -1),
+                })
+            if rows:
+                df_u = pd.DataFrame(rows)
+                header = not undersample_csv_path.exists()
+                df_u.to_csv(undersample_csv_path, index=False, encoding="utf-8-sig", mode="a", header=header)
+        trained_model = final_model
+        print("学習完了。")
+
     # モデル保存パラメータまとめ
     train_params = {
         "backend": "xgb" if backend == "xgb" else "rf",
@@ -3260,7 +3511,7 @@ def train_mode(backend: str = "rf"):
     }
 
     # 既存: run_id 付きのファイル
-    joblib.dump(pipe, model_path)
+    joblib.dump(trained_model, model_path)
     print(f"\n[保存] モデル: {model_path}")
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -3269,17 +3520,19 @@ def train_mode(backend: str = "rf"):
     # オプション: 直近モデルへのショートカット
     latest_model = model_root / "rf_model.joblib"
     latest_meta  = model_root / "rf_meta.json"
-    joblib.dump(pipe, latest_model)
+    joblib.dump(trained_model, latest_model)
     with open(latest_meta, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
     print(f"[保存] 直近モデル: {latest_model}")
 
-    # 特徴量重要度
+    # 特徴量重要度（UnderSampledClassifier の場合は内部 Pipeline を参照）
+    base_pipe = trained_model.estimator_ if hasattr(trained_model, "estimator_") else trained_model
+
     if backend == "xgb":
-        est = pipe.named_steps.get("xgb")
+        est = base_pipe.named_steps.get("xgb") if hasattr(base_pipe, "named_steps") else None
         latest_imp = model_root / "xgb_feature_importance.csv"
     else:
-        est = pipe.named_steps.get("rf")
+        est = base_pipe.named_steps.get("rf") if hasattr(base_pipe, "named_steps") else None
         latest_imp = model_root / "rf_feature_importance.csv"
 
     if est is not None and hasattr(est, "feature_importances_"):
@@ -3492,6 +3745,7 @@ def predict_mode():
     print(f"  → 予測結果は {out_path} に保存されます。")
     out_dir = Path(out_path).parent
     out_dir.mkdir(parents=True, exist_ok=True)
+    undersample_csv_path = out_dir / f"rf_undersample_info_{run_id}.csv"    
 
     # ここまでで out_path（予測結果を書き出すパス）が決まっている前提
     # 評価結果の出力用プレフィックスも、その out_path と同じディレクトリに揃える
