@@ -2446,40 +2446,16 @@ def train_mode(backend: str = "rf"):
     apply_undersample_to_final_fit = False
 
     if use_undersample:
-        import collections
+        # 全体のクラス分布（target_n のデフォルト提示用）
         counts_all = collections.Counter(y.tolist() if hasattr(y, "tolist") else list(y))
         min_all = min(counts_all.values()) if counts_all else None
+
         print("\n[INFO] 目的変数のクラス別件数（全体）:")
-        for k_ in sorted(counts_all):
+        for k_ in sorted(counts_all.keys()):
             print(f"  - {k_}: {counts_all[k_]}")
         print(f"[INFO] 最小クラス数（全体）: {min_all}")
 
         n_in = input(f"  → 各クラスの上限件数 target_n（空={min_all}）: ").strip()
-        if n_in:
-            undersample_target_n = int(n_in)
-
-        apply_undersample_to_final_fit = ask_yes_no(
-            "  → 最終保存モデルの fit（全データ再学習）にも同じアンダーサンプリングを適用しますか？",
-            default=False,
-        )
-
-    if use_undersample:
-        # 全体のクラス分布（target_n のデフォルト提示用）
-        import collections
-
-        counts_all = collections.Counter(y.tolist() if hasattr(y, "tolist") else list(y))
-        if counts_all:
-            min_all = min(counts_all.values())
-            print("\n[INFO] 目的変数のクラス別件数（全体）:")
-            for k_ in sorted(counts_all.keys()):
-                print(f"  - {k_}: {counts_all[k_]}")
-            print(f"[INFO] 最小クラス数（全体）: {min_all}")
-        else:
-            min_all = None
-
-        n_in = input(
-            f"  → 各クラスの上限件数 target_n（空={min_all}）: "
-        ).strip()
         if n_in:
             try:
                 undersample_target_n = int(n_in)
