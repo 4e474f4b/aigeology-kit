@@ -75,6 +75,34 @@ def safe_to_str_series(s: pd.Series) -> pd.Series:
     # NaN を "nan" にしたくないので空文字化
     return s.astype("string").fillna(pd.NA).astype("string")
 
+def coerce_column_for_write(df: pd.DataFrame, col: str, kind: str) -> pd.DataFrame:
+    """
+    parquet/arrow 書き出しで object の混在（str/int 等）を避けるため、列を一貫した型に寄せる。
+    - kind == "numeric": to_numeric して Float64/Int64 相当へ
+    - kind == "string": pandas string へ
+    """
+    if col not in df.columns:
+        return df
+    s = pd.Series(df[col])
+    if kind == "numeric":
+        num = pd.to_numeric(s, errors="coerce")
+        # 整数っぽいなら Int64（nullable）へ寄せる
+        nn = num.dropna()
+        if len(nn) > 0:
+            is_int_like = (nn % 1 == 0).all()
+        else:
+            is_int_like = True
+        if is_int_like:
+            df[col] = num.round(0).astype("Int64")
+        else:
+            df[col] = num.astype("Float64")
+        return df
+    if kind == "string":
+        df[col] = safe_to_str_series(s)
+        return df
+    # mixed は触らない（呼び出し側で明示する）
+    return df
+
 def summarize_series_kind(s: pd.Series, numeric_threshold: float = 0.95) -> Tuple[str, float, str]:
     """
     列の「実用上の型」を推定して返す。
@@ -99,10 +127,21 @@ def print_kind_hint(col_name: str, kind: str, parse_rate: float, dtype_str: str)
     elif kind == "string":
         kmsg = "文字列"
     else:
-        kmsg = "混在列（文字列/数値が混ざっている可能性）"
+        kmsg = "混在（文字列/数値）"
     # 後続表示（列一覧など）と視覚的に分離
     print(f"[INFO] 列型推定: {col_name} = {kmsg}  (dtype={dtype_str}, numeric_rate={parse_rate:.3f})")
     print("")
+
+def print_op_guidance_for_editcol(kind: str) -> None:
+    # 「編集操作メニューの番号」を出さない（値入力と混同されるため）
+    if kind == "numeric":
+        print("[INFO] edit_col 推奨操作: 上書き / 加算 / 乗算")
+        print("[INFO] 注意: 置換は文字列化して実行されます")
+    elif kind == "string":
+        print("[INFO] edit_col 推奨操作: 上書き / 置換")
+        print("[INFO] 注意: 加算/乗算は数値化できない行が欠損になり得ます")
+    else:
+        print("[INFO] edit_col 注意: 混在列のため、置換/加算/乗算で欠損が発生し得ます")
 
 def is_missing_value(v: Any) -> bool:
     # pandas.NA / None / NaN を欠損として扱う
@@ -547,39 +586,50 @@ def main() -> int:
         return 0
 
     # ここからは「列を書き換える」編集
-    # 編集対象列
-    try:
-        edit_col = select_column_interactive(cols, prompt_label="編集対象列（書き換え先）")
-    except KeyboardInterrupt:
-        print("[INFO] 中断。")
-        return 0
+    # 編集対象列（上書き値の入力と混同しないよう、選択式に固定）
+    print("=== 編集対象列（書き換え先）===")
+    print(f"  1) 検索対象列を使う（{filter_col}）")
+    print("  2) 別の列を選ぶ")
+    while True:
+        m_ec = input("番号を選択 [1-2]: ").strip()
+        if m_ec in ("1", "2"):
+            break
+        print("[ERROR] 範囲外。")
+    if m_ec == "1":
+        edit_col = filter_col
+    else:
+        try:
+            edit_col = select_column_interactive(cols, prompt_label="編集対象列（書き換え先）")
+        except KeyboardInterrupt:
+            print("[INFO] 中断。")
+            return 0
 
     # edit_col の列型推定と、操作との対応表示
     e_raw = pd.Series(df2[edit_col])
     e_kind, e_rate, e_dtype = summarize_series_kind(e_raw, numeric_threshold=0.95)
     print_kind_hint(edit_col, e_kind, e_rate, e_dtype)
-    if e_kind == "numeric":
-        print("[INFO] 推奨操作: 1(上書き), 3(加算), 4(乗算)  / 注意: 2(置換)は文字列化されます")
-    elif e_kind == "string":
-        print("[INFO] 推奨操作: 1(上書き), 2(置換)  / 注意: 3,4 は数値化できない行が NaN になり得ます")
-    else:
-        print("[INFO] 注意: 混在列のため 2/3/4 の挙動に注意（文字列化/数値化で欠損が発生し得ます）")
+    print_op_guidance_for_editcol(e_kind)
 
     if op == 1:
-        raw = input("上書きする値（そのまま文字列。数値にしたい場合は例: 12.3）: ").strip()
-        # 数値にできるなら数値、できなければ文字列
-        val: Any = raw
-        if raw == "":
-            val = ""
+        raw = input("上書きする値（データ値を入力）: ").strip()
+        # 列の推定型に合わせて一貫型へ寄せる（object混在→arrow失敗回避）
+        if e_kind == "numeric":
+            df2 = coerce_column_for_write(df2, edit_col, kind="numeric")
+            if raw == "":
+                val: Any = pd.NA
+            else:
+                try:
+                    val = float(raw) if "." in raw else int(raw)
+                except Exception:
+                    print("[ERROR] edit_col は数値列推定です。数値として解釈できない入力です。")
+                    return 1
+            df2.loc[mask, edit_col] = val
+            # 代入後に再度型を揃える（Int64/Float64）
+            df2 = coerce_column_for_write(df2, edit_col, kind="numeric")
         else:
-            try:
-                if "." in raw:
-                    val = float(raw)
-                else:
-                    val = int(raw)
-            except Exception:
-                val = raw
-        df2.loc[mask, edit_col] = val
+            # string/mixed は文字列で上書き（mixedでもarrow事故を避けるため string 側に倒す）
+            df2 = coerce_column_for_write(df2, edit_col, kind="string")
+            df2.loc[mask, edit_col] = (raw if raw != "" else pd.NA)
 
     elif op == 2:
         repl_pat = input("置換対象の正規表現: ").strip()
@@ -592,13 +642,12 @@ def main() -> int:
             print(f"[ERROR] 正規表現エラー: {e}")
             return 1
         repl_to = input("置換後文字列: ")
-        # 文字列化して置換
+        # 文字列化して置換（object混在を解消）
+        df2 = coerce_column_for_write(df2, edit_col, kind="string")
         s_edit = safe_to_str_series(pd.Series(df2[edit_col]))
         df2.loc[mask, edit_col] = s_edit.loc[mask].str.replace(repl_pat, repl_to, regex=True)
 
     elif op == 3:
-        if e_kind == "string":
-            print("[WARN] edit_col が文字列列推定です。数値化できない行は NaN になります。")
         delta_s = input("加算値（例: 1.5）: ").strip()
         try:
             delta = float(delta_s)
@@ -606,22 +655,24 @@ def main() -> int:
             print("[ERROR] 数値に変換できません。")
             return 1
         # 数値化して加算
+        df2 = coerce_column_for_write(df2, edit_col, kind="numeric")
         num = pd.to_numeric(df2[edit_col], errors="coerce")
         num.loc[mask] = num.loc[mask] + delta
         df2[edit_col] = num
+        df2 = coerce_column_for_write(df2, edit_col, kind="numeric")
 
     elif op == 4:
-        if e_kind == "string":
-            print("[WARN] edit_col が文字列列推定です。数値化できない行は NaN になります。")
         mul_s = input("乗算係数（例: 0.1）: ").strip()
         try:
             mul = float(mul_s)
         except Exception:
             print("[ERROR] 数値に変換できません。")
             return 1
+        df2 = coerce_column_for_write(df2, edit_col, kind="numeric")
         num = pd.to_numeric(df2[edit_col], errors="coerce")
         num.loc[mask] = num.loc[mask] * mul
         df2[edit_col] = num
+        df2 = coerce_column_for_write(df2, edit_col, kind="numeric")
 
     else:
         print("[ERROR] 未対応。")
