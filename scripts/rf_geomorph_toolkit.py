@@ -161,6 +161,36 @@ except Exception:
 
 import fiona
 
+
+def _json_default(o):
+    """
+    json.dump 用: NumPy / pandas / Path などを JSON 互換型へ変換
+    """
+    # numpy scalar
+    if isinstance(o, (np.integer,)):
+        return int(o)
+    if isinstance(o, (np.floating,)):
+        return float(o)
+    if isinstance(o, (np.bool_,)):
+        return bool(o)
+    # numpy array
+    if isinstance(o, (np.ndarray,)):
+        return o.tolist()
+    # pathlib
+    if isinstance(o, (Path,)):
+        return str(o)
+    # pandas timestamp / timedelta
+    try:
+        import pandas as _pd
+        if isinstance(o, (_pd.Timestamp,)):
+            return o.isoformat()
+        if isinstance(o, (_pd.Timedelta,)):
+            return str(o)
+    except Exception:
+        pass
+    raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
+
+
 # =========================================================
 # 共通ヘルパ
 # =========================================================
@@ -3490,7 +3520,7 @@ def train_mode(backend: str = "rf"):
     joblib.dump(trained_model, model_path)
     print(f"\n[保存] モデル: {model_path}")
     with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
+        json.dump(meta, f, ensure_ascii=False, indent=2, default=_json_default)
     print(f"[保存] メタ情報: {meta_path}")
 
     # オプション: 直近モデルへのショートカット
@@ -3498,7 +3528,7 @@ def train_mode(backend: str = "rf"):
     latest_meta  = model_root / "rf_meta.json"
     joblib.dump(trained_model, latest_model)
     with open(latest_meta, "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
+        json.dump(meta, f, ensure_ascii=False, indent=2, default=_json_default)
     print(f"[保存] 直近モデル: {latest_model}")
 
     # 特徴量重要度（UnderSampledClassifier の場合は内部 Pipeline を参照）
@@ -4031,18 +4061,23 @@ def predict_mode():
         # LabelEncoder 未使用の場合
         # ---------------------------
         else:
-            y_true = y_true_raw
+            # sklearn.metrics 内部で labels/y_true を sort するため、
+            # int と str が混在すると TypeError になる（np.intersect1d -> sort）。
+            # ここでは評価用ラベルをすべて文字列に正規化して扱う。
+            y_true = pd.Series(y_true_raw).astype(str).values
+            y_pred_eval = pd.Series(y_pred_labels).astype(str).values
+
             # class_names があればそれを「全クラス」とみなす
             if class_names:
-                all_labels = list(class_names)
-                rep_target_names = [str(c) for c in all_labels]
+                all_labels = [str(c) for c in class_names]
+                rep_target_names = list(all_labels)
             else:
                 # なければ今回のデータに出てきたクラスだけでやる
                 uniq = sorted(pd.unique(y_true))
                 all_labels = list(uniq)
-                rep_target_names = [str(u) for u in uniq]
+                rep_target_names = list(all_labels)
 
-            cm = confusion_matrix(y_true, y_pred_labels, labels=all_labels)
+            cm = confusion_matrix(y_true, y_pred_eval, labels=all_labels)
             print("混同行列（行: 真, 列: 予測）:")
             print(cm)
 
@@ -4050,7 +4085,7 @@ def predict_mode():
             print(
                 classification_report(
                     y_true,
-                    y_pred_labels,
+                    y_pred_eval,
                     labels=all_labels,
                     target_names=rep_target_names,
                     zero_division=0,
