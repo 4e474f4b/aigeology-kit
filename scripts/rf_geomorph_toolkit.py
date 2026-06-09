@@ -3523,10 +3523,8 @@ def train_mode(backend: str = "rf"):
 
     if backend == "xgb":
         est = base_pipe.named_steps.get("xgb") if hasattr(base_pipe, "named_steps") else None
-        latest_imp = model_root / "xgb_feature_importance.csv"
     else:
         est = base_pipe.named_steps.get("rf") if hasattr(base_pipe, "named_steps") else None
-        latest_imp = model_root / "rf_feature_importance.csv"
 
     if est is not None and hasattr(est, "feature_importances_"):
         importances = est.feature_importances_
@@ -3551,8 +3549,6 @@ def train_mode(backend: str = "rf"):
         plt.close(fig)
         print(f"[保存] 特徴量重要度 図: {fig_path}")
 
-        imp_df.to_csv(latest_imp, index=False, encoding="utf-8")
-        print(f"[保存] 直近特徴量重要度 CSV: {latest_imp}")
     else:
         print("\n[INFO] このモデルでは feature_importances_ が利用できないため、特徴量重要度の出力をスキップしました。")
 
