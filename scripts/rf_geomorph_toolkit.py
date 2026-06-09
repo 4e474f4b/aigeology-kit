@@ -205,6 +205,13 @@ def save_gpkg_with_points(df, out_path, x_col="x", y_col="y",
     w[x_col] = w[x_col].astype(float)
     w[y_col] = w[y_col].astype(float)
 
+    # OGR/GPKG の予約フィールド名と衝突する列をリネーム
+    _OGR_RESERVED = {"fid", "FID"}
+    rename_map = {c: f"{c}_orig" for c in w.columns if c in _OGR_RESERVED}
+    if rename_map:
+        print(f"[INFO] OGR予約列名を自動リネームします: {rename_map}")
+        w = w.rename(columns=rename_map)
+
     geom = [Point(xy) for xy in zip(w[x_col].values, w[y_col].values)]
     gdf = gpd.GeoDataFrame(w, geometry=geom, crs=crs_epsg)
 
@@ -2456,14 +2463,6 @@ def train_mode(backend: str = "rf"):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # -------------------------------
-    # モデル出力ディレクトリ確定
-    # -------------------------------
-    run_name = f"{base_name}_{backend}_{run_id}"
-
-    model_dir = Path(model_root) / run_name
-    model_dir.mkdir(parents=True, exist_ok=True)
-
-    # -------------------------------
     # アンダーサンプリング（train 側を各クラス同数に揃える）
     # -------------------------------
     use_undersample = ask_yes_no(
@@ -2471,7 +2470,7 @@ def train_mode(backend: str = "rf"):
         default=False,
     )
 
-    undersample_csv_path = model_dir / f"rf_undersample_info_{run_id}.csv"
+    undersample_csv_path = out_dir / f"rf_undersample_info_{run_id}.csv"
     undersample_target_n: int | None = None
     apply_undersample_to_final_fit = False
 
@@ -2577,7 +2576,7 @@ def train_mode(backend: str = "rf"):
         if enable_learning_curve:
             print("\n[Learning Curve] Monte Carlo CV 設定で学習曲線を計算中...")
             _plot_learning_curve(
-                estimator_for_fit,
+                pipe,
                 X,
                 y,
                 cv=cv,
@@ -2907,7 +2906,7 @@ def train_mode(backend: str = "rf"):
         if enable_learning_curve:
             print("\n[Learning Curve] k-fold CV 設定で学習曲線を計算中...")
             _plot_learning_curve(
-                estimator_for_fit,
+                pipe,
                 X,
                 y,
                 cv=cv,
@@ -3155,7 +3154,7 @@ def train_mode(backend: str = "rf"):
                 )
 
             _plot_learning_curve(
-                estimator_for_fit,
+                pipe,
                 X,
                 y,
                 cv=cv_lc,
