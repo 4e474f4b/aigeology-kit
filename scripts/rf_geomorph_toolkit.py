@@ -86,10 +86,7 @@ rf_geomorph_toolkit.py
         ├ rf_feature_importance_<run_id>.png
         ├ rf_confusion_matrix_<run_id>.png
         └ rf_confusion_matrix_normalized_<run_id>.png
-  - 直近モデルへのショートカット:
-      <出力ルート>/
-        ├ rf_model.joblib
-        └ rf_meta.json
+
 
 この docstring を見れば、
   * 学習用テーブルの作り方（ラスター＋ポリゴン → グリッドサンプリング）
@@ -693,8 +690,6 @@ def _plot_learning_curve(
 # ユーティリティ
 # =========================================================
 
-MODEL_DEFAULT = "rf_model.joblib"
-META_DEFAULT  = "rf_meta.json"
 # IMP_DEFAULT   = "rf_feature_importance.csv"
 
 
@@ -3522,13 +3517,6 @@ def train_mode(backend: str = "rf"):
         json.dump(meta, f, ensure_ascii=False, indent=2, default=_json_default)
     print(f"[保存] メタ情報: {meta_path}")
 
-    # オプション: 直近モデルへのショートカット
-    latest_model = model_root / "rf_model.joblib"
-    latest_meta  = model_root / "rf_meta.json"
-    joblib.dump(trained_model, latest_model)
-    with open(latest_meta, "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2, default=_json_default)
-    print(f"[保存] 直近モデル: {latest_model}")
 
     # 特徴量重要度（UnderSampledClassifier の場合は内部 Pipeline を参照）
     base_pipe = trained_model.estimator_ if hasattr(trained_model, "estimator_") else trained_model
@@ -3579,16 +3567,12 @@ def load_model_and_meta():
     """
     保存済みモデルとメタ情報を対話的に読み込む。
     """
-    model_path = strip_quotes(input(f"モデルのパス（空={MODEL_DEFAULT}）: ").strip())
-    if not model_path:
-        model_path = MODEL_DEFAULT
+    model_path = strip_quotes(input("モデルのパス（.joblib）: ").strip())
     if not os.path.exists(model_path):
         print(f"モデルファイルが見つかりません: {model_path}")
         sys.exit(1)
 
-    meta_path = strip_quotes(input(f"メタ情報 JSON のパス（空={META_DEFAULT}）: ").strip())
-    if not meta_path:
-        meta_path = META_DEFAULT
+    meta_path = strip_quotes(input("メタ情報 JSON のパス（.json）: ").strip())
     if not os.path.exists(meta_path):
         print(f"メタ情報ファイルが見つかりません: {meta_path}")
         sys.exit(1)
