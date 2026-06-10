@@ -148,6 +148,7 @@ except Exception:
     XGBClassifier = None
 
 import matplotlib.pyplot as plt
+import matplotlib.patheffects as pe
 import geopandas as gpd
 
 try:
@@ -450,10 +451,14 @@ def _plot_confusion_matrix(cm, labels, normalize=False,
     thresh = cm_plot.max() / 2.0 if cm_plot.size > 0 else 0
     for i in range(cm_plot.shape[0]):
         for j in range(cm_plot.shape[1]):
+            dark = cm_plot[i, j] > thresh
             ax.text(
                 j, i, format(cm_plot[i, j], fmt),
                 ha="center", va="center",
-                color="white" if cm_plot[i, j] > thresh else "black",
+                color="white" if dark else "black",
+                path_effects=[pe.withStroke(
+                    linewidth=2, foreground="black" if dark else "white"
+                )],
             )
 
     fig.tight_layout()
