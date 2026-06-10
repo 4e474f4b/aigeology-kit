@@ -3706,16 +3706,22 @@ def predict_mode():
 
     # =====================================================
     # 予測結果の保存先を「最初に」決めておく
+    # 学習モードと同様に predict_{run_id}/ サブフォルダを自動作成
     # =====================================================
+    in_stem = Path(in_path).stem
+    in_parent = Path(in_path).parent
+    out_dir = in_parent / f"predict_{run_id}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     low_in = in_path.lower()
     if low_in.endswith(".csv"):
-        default_out_path = f"{base_in}_pred_{run_id}.csv"
+        default_out_path = str(out_dir / f"{in_stem}_pred_{run_id}.csv")
     elif low_in.endswith(".parquet") or low_in.endswith(".pq"):
-        default_out_path = f"{base_in}_pred_{run_id}.parquet"
+        default_out_path = str(out_dir / f"{in_stem}_pred_{run_id}.parquet")
     elif low_in.endswith(".gpkg"):
-        default_out_path = f"{base_in}_pred_{run_id}.gpkg"
+        default_out_path = str(out_dir / f"{in_stem}_pred_{run_id}.gpkg")
     else:
-        default_out_path = f"{base_in}_pred_{run_id}.csv"
+        default_out_path = str(out_dir / f"{in_stem}_pred_{run_id}.csv")
 
     print("\n[出力先の設定]")
     print(f"  デフォルト: {default_out_path}")
@@ -3726,16 +3732,16 @@ def predict_mode():
     if not out_path:
         out_path = default_out_path
     else:
-        # ユーザーがディレクトリを指定した場合の扱い
         p = Path(out_path)
-        # 既存ディレクトリ、または末尾が / or \ の場合は「ディレクトリ指定」とみなす
         if p.is_dir() or out_path.endswith(("/", "\\")):
             out_path = str(p / Path(default_out_path).name)
             print(f"  → ディレクトリ指定と判断し、{out_path} に保存します。")
+        else:
+            # 明示的にパスを指定した場合はそのディレクトリを out_dir にする
+            out_dir = Path(out_path).parent
+            out_dir.mkdir(parents=True, exist_ok=True)
     print(f"  → 予測結果は {out_path} に保存されます。")
-    out_dir = Path(out_path).parent
-    out_dir.mkdir(parents=True, exist_ok=True)
-    undersample_csv_path = out_dir / f"rf_undersample_info_{run_id}.csv"    
+    undersample_csv_path = out_dir / f"rf_undersample_info_{run_id}.csv"
 
     # ここまでで out_path（予測結果を書き出すパス）が決まっている前提
     # 評価結果の出力用プレフィックスも、その out_path と同じディレクトリに揃える
@@ -4332,10 +4338,12 @@ def predict_mode():
     #      ステップから自動でモデルを検出する
     # =====================================================
     try:
+        # UnderSampledClassifier でラップされている場合は内部 Pipeline を取り出す
+        base_pipe = pipe.estimator_ if hasattr(pipe, "estimator_") else pipe
         model_step = None
         for key in ("rf", "xgb"):
-            if key in pipe.named_steps:
-                model_step = pipe.named_steps[key]
+            if hasattr(base_pipe, "named_steps") and key in base_pipe.named_steps:
+                model_step = base_pipe.named_steps[key]
                 break
 
         if model_step is None:
