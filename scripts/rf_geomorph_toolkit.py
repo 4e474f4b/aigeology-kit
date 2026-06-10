@@ -4228,7 +4228,7 @@ def predict_mode():
 
             # GPKG
             if pred_gpkg_enable:
-                pred_gpkg_path = out_dir / f"{Path(base_out).name}_pred_{run_id}.gpkg"
+                pred_gpkg_path = out_dir / f"{in_stem}_pred_{run_id}.gpkg"
                 save_gpkg_with_points(
                     pred_gpkg_out,
                     pred_gpkg_path,
@@ -4241,7 +4241,7 @@ def predict_mode():
 
             # GeoParquet
             if pred_parquet_enable:
-                pred_parquet_path = out_dir / f"{Path(base_out).name}_pred_{run_id}.parquet"
+                pred_parquet_path = out_dir / f"{in_stem}_pred_{run_id}.parquet"
                 try:
                     save_geoparquet_with_points(
                         pred_gpkg_out,
@@ -4268,7 +4268,7 @@ def predict_mode():
             # GPKG
             if eval_gpkg_enable:
                 eval_gpkg_path = (
-                    out_dir / f"{Path(base_out).name}_eval_predict_{run_id}.gpkg"
+                    out_dir / f"{in_stem}_eval_predict_{run_id}.gpkg"
                 )
                 save_gpkg_with_points(
                     eval_gpkg_out,
@@ -4283,7 +4283,7 @@ def predict_mode():
             # GeoParquet
             if eval_parquet_enable:
                 eval_parquet_path = (
-                    out_dir / f"{Path(base_out).name}_eval_predict_{run_id}.parquet"
+                    out_dir / f"{in_stem}_eval_predict_{run_id}.parquet"
                 )
                 try:
                     save_geoparquet_with_points(
