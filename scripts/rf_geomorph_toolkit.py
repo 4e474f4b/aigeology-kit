@@ -3715,13 +3715,13 @@ def predict_mode():
 
     low_in = in_path.lower()
     if low_in.endswith(".csv"):
-        default_out_path = str(out_dir / f"{in_stem}_pred_{run_id}.csv")
+        default_out_path = str(out_dir / f"{in_stem}_pred_table_{run_id}.csv")
     elif low_in.endswith(".parquet") or low_in.endswith(".pq"):
-        default_out_path = str(out_dir / f"{in_stem}_pred_{run_id}.parquet")
+        default_out_path = str(out_dir / f"{in_stem}_pred_table_{run_id}.parquet")
     elif low_in.endswith(".gpkg"):
-        default_out_path = str(out_dir / f"{in_stem}_pred_{run_id}.gpkg")
+        default_out_path = str(out_dir / f"{in_stem}_pred_table_{run_id}.gpkg")
     else:
-        default_out_path = str(out_dir / f"{in_stem}_pred_{run_id}.csv")
+        default_out_path = str(out_dir / f"{in_stem}_pred_table_{run_id}.csv")
 
     print("\n[出力先の設定]")
     print(f"  デフォルト: {default_out_path}")
@@ -4228,7 +4228,7 @@ def predict_mode():
 
             # GPKG
             if pred_gpkg_enable:
-                pred_gpkg_path = out_dir / f"{in_stem}_pred_geo_{run_id}.gpkg"
+                pred_gpkg_path = out_dir / f"{in_stem}_pred_{run_id}.gpkg"
                 save_gpkg_with_points(
                     pred_gpkg_out,
                     pred_gpkg_path,
@@ -4241,7 +4241,7 @@ def predict_mode():
 
             # GeoParquet
             if pred_parquet_enable:
-                pred_parquet_path = out_dir / f"{in_stem}_pred_geo_{run_id}.parquet"
+                pred_parquet_path = out_dir / f"{in_stem}_pred_{run_id}.parquet"
                 try:
                     save_geoparquet_with_points(
                         pred_gpkg_out,
@@ -4268,7 +4268,7 @@ def predict_mode():
             # GPKG
             if eval_gpkg_enable:
                 eval_gpkg_path = (
-                    out_dir / f"{in_stem}_eval_geo_{run_id}.gpkg"
+                    out_dir / f"{in_stem}_eval_{run_id}.gpkg"
                 )
                 save_gpkg_with_points(
                     eval_gpkg_out,
@@ -4283,7 +4283,7 @@ def predict_mode():
             # GeoParquet
             if eval_parquet_enable:
                 eval_parquet_path = (
-                    out_dir / f"{in_stem}_eval_geo_{run_id}.parquet"
+                    out_dir / f"{in_stem}_eval_{run_id}.parquet"
                 )
                 try:
                     save_geoparquet_with_points(
@@ -4421,7 +4421,7 @@ def predict_mode():
             print(f"\n✅ 予測結果（Parquet）を書き出しました: {out_path}")
         except Exception as e:
             print(f"Parquet 失敗 → CSVで再保存します: {e}")
-            out_fallback = f"{base_in}_pred_{run_id}.csv"
+            out_fallback = f"{base_in}_pred_table_{run_id}.csv"
             out.to_csv(out_fallback, index=False, encoding="utf-8")
             print(f"\n✅ 予測結果（CSV）を書き出しました: {out_fallback}")
     else:
