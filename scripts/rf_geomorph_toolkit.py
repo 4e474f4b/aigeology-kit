@@ -3734,7 +3734,9 @@ def predict_mode():
     else:
         p = Path(out_path)
         if p.is_dir() or out_path.endswith(("/", "\\")):
-            out_path = str(p / Path(default_out_path).name)
+            out_dir = Path(out_path)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = str(out_dir / Path(default_out_path).name)
             print(f"  → ディレクトリ指定と判断し、{out_path} に保存します。")
         else:
             # 明示的にパスを指定した場合はそのディレクトリを out_dir にする
