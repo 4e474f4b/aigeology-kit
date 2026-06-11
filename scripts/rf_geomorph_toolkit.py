@@ -2752,7 +2752,7 @@ def train_mode(backend: str = "rf"):
 
                 # Monte Carlo 最終分割の評価用 GeoParquet も保存（オプション）
                 if save_parquet:
-                    eval_parquet_path = out_dir / f"{base.stem}_eval_mc_last_geo_{run_id}.parquet"
+                    eval_parquet_path = out_dir / f"{base.stem}_eval_mc_last_{run_id}_geo.parquet"
                     try:
                         save_geoparquet_with_points(
                             eval_df,
@@ -2813,7 +2813,7 @@ def train_mode(backend: str = "rf"):
 
                     if save_parquet:
                         # Monte Carlo 最終分割の学習用 Parquet も保存
-                        train_parquet_path = out_dir / f"{base.stem}_train_mc_last_geo_{run_id}.parquet"
+                        train_parquet_path = out_dir / f"{base.stem}_train_mc_last_{run_id}_geo.parquet"
                         try:
                             save_geoparquet_with_points(
                                 train_df,
@@ -3061,7 +3061,7 @@ def train_mode(backend: str = "rf"):
 
                 if save_parquet:
                     # CV OOF 評価用 GeoParquet も保存
-                    eval_parquet_path = out_dir / f"{base.stem}_eval_cv_oof_geo_{run_id}.parquet"
+                    eval_parquet_path = out_dir / f"{base.stem}_eval_cv_oof_{run_id}_geo.parquet"
                     try:
                         save_geoparquet_with_points(
                             eval_df,
@@ -3350,7 +3350,7 @@ def train_mode(backend: str = "rf"):
 
                 if save_parquet:
                     # 評価用 GeoParquet（geometry 付き）も保存
-                    eval_parquet_path = out_dir / f"{base.stem}_eval_holdout_geo_{run_id}.parquet"
+                    eval_parquet_path = out_dir / f"{base.stem}_eval_holdout_{run_id}_geo.parquet"
                     try:
                         save_geoparquet_with_points(
                             eval_df,
@@ -3409,7 +3409,7 @@ def train_mode(backend: str = "rf"):
 
                 if save_parquet:
                     # 学習データ側の GeoParquet も保存（geometry 付き）
-                    train_parquet_path = out_dir / f"{base.stem}_train_holdout_geo_{run_id}.parquet"
+                    train_parquet_path = out_dir / f"{base.stem}_train_holdout_{run_id}_geo.parquet"
                     try:
                         save_geoparquet_with_points(
                             train_df,
@@ -3717,7 +3717,7 @@ def predict_mode():
     if low_in.endswith(".csv"):
         default_out_path = str(out_dir / f"{in_stem}_pred_table_{run_id}.csv")
     elif low_in.endswith(".parquet") or low_in.endswith(".pq"):
-        default_out_path = str(out_dir / f"{in_stem}_pred_plain_{run_id}.parquet")
+        default_out_path = str(out_dir / f"{in_stem}_pred_{run_id}_plain.parquet")
     elif low_in.endswith(".gpkg"):
         default_out_path = str(out_dir / f"{in_stem}_pred_table_{run_id}.gpkg")
     else:
@@ -4241,7 +4241,7 @@ def predict_mode():
 
             # GeoParquet
             if pred_parquet_enable:
-                pred_parquet_path = out_dir / f"{in_stem}_pred_geo_{run_id}.parquet"
+                pred_parquet_path = out_dir / f"{in_stem}_pred_{run_id}_geo.parquet"
                 try:
                     save_geoparquet_with_points(
                         pred_gpkg_out,
@@ -4283,7 +4283,7 @@ def predict_mode():
             # GeoParquet
             if eval_parquet_enable:
                 eval_parquet_path = (
-                    out_dir / f"{in_stem}_eval_geo_{run_id}.parquet"
+                    out_dir / f"{in_stem}_eval_{run_id}_geo.parquet"
                 )
                 try:
                     save_geoparquet_with_points(
