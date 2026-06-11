@@ -3739,7 +3739,7 @@ def predict_mode():
     else:
         p = Path(out_path)
         if p.is_dir() or out_path.endswith(("/", "\\")):
-            out_dir = p
+            out_dir = p / f"predict_{run_id}"
             out_path = str(out_dir / default_filename)
             print(f"  → ディレクトリ指定と判断し、{out_path} に保存します。")
         else:
