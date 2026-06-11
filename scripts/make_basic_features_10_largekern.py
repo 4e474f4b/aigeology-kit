@@ -434,6 +434,9 @@ def openness_pair(dem, px: float, r_open: float, n_dirs: int = 8, step_stride: i
 
 # =============== SAGA 開度 ===============
 
+_GFLAGS_ERROR = "flag 'help' was defined more than once"
+
+
 def confirm_saga_openness_tool(saga_cmd_path: str, tool_id: int = 5) -> bool:
     try:
         result = subprocess.run(
@@ -441,15 +444,21 @@ def confirm_saga_openness_tool(saga_cmd_path: str, tool_id: int = 5) -> bool:
             capture_output=True, text=True, timeout=15,
         )
         output = result.stdout + result.stderr
+        if _GFLAGS_ERROR in output:
+            print("  [WARN] SAGA の gflags 競合エラーを検出しました → Python 内蔵モードに切り替えます。")
+            return False
         if f"{tool_id}" in output or "Topographic Openness" in output:
             return True
-        print(f"\n=== SAGA ta_lighting モジュールの一覧を確認します... ===")
+        print("\n=== SAGA ta_lighting モジュールの一覧を確認します... ===")
         result2 = subprocess.run(
             [saga_cmd_path, "ta_lighting"],
             capture_output=True, text=True, timeout=15,
         )
-        print(result2.stdout[:2000])
-        print(result2.stderr[:500])
+        out2 = result2.stdout + result2.stderr
+        if _GFLAGS_ERROR in out2:
+            print("  [WARN] SAGA の gflags 競合エラーを検出しました → Python 内蔵モードに切り替えます。")
+            return False
+        print(out2[:2000])
         return True
     except Exception as e:
         print(f"  SAGA 確認中にエラー: {e}")
@@ -610,24 +619,6 @@ def main():
         R_eff = d * px
         print(f"    k={k}（{k}×{k}窓）  d={d}px  有効半径≒{R_eff:.1f}m  カバー範囲≒{k*px:.0f}m")
 
-    # 開度スケール（k から R_open_match を自動算出）
-    print("\n  1: 外接円（正方形窓の外接円） R_open = √2 × R_eff")
-    print("  2: 面積等価円（k×k窓と同面積） R_open = (2/√π) × R_eff")
-    print("  3: 内接円（正方形窓の内接円） R_open = R_eff")
-    match_mode = ask_int("番号を選んでください", 2)
-
-    if match_mode == 2:
-        coeff = 2.0 / math.sqrt(math.pi)
-        mode_label = "面積等価円 (2/√π × R_eff)"
-    elif match_mode == 3:
-        coeff = 1.0
-        mode_label = "内接円 (= R_eff)"
-    else:
-        coeff = math.sqrt(2.0)
-        mode_label = "外接円 (√2 × R_eff)"
-
-    print(f"  → 採用方式: {mode_label}")
-
     win_pix_list      = []
     r_eff_list        = []
     r_open_match_list = []
@@ -635,64 +626,31 @@ def main():
         win_pix_list.append(k)
         R_eff = ((k - 1) / 2.0) * px
         r_eff_list.append(R_eff)
-        r_open_match_list.append(coeff * R_eff)
+        r_open_match_list.append(R_eff)  # デフォルトは R_eff（内接円相当）
 
     mask_win_candidates = list(win_pix_list)
 
-    # 開度パラメータ
-    openness_r_list = []
-    n_dirs = None
+    # 開度パラメータ（スケールは k から自動決定、方向数のみ聞く）
+    n_dirs = 8
     step_stride = 1
 
     if openness_mode != 3:
-        default_open_list = [float(f"{v:.3f}") for v in r_open_match_list]
-        info_pairs = ", ".join(
-            f"k={k}→R_open_match≒{Ropen:.3g}m"
-            for k, Ropen in zip(k_list, r_open_match_list)
-        )
-        openness_r_list = ask_float_list(
-            "開度の最大距離 R_open[m]（カンマ区切り可, Enterで比高と同スケール推奨値）"
-            f"\n  スケール対応の目安: {info_pairs}",
-            default_open_list,
-        )
-        openness_r_list = [float(x) for x in openness_r_list if float(x) > 0.0]
-        _seen = set()
-        _tmp = []
-        for x in openness_r_list:
-            key = round(x, 6)
-            if key in _seen:
-                continue
-            _seen.add(key)
-            _tmp.append(x)
-        openness_r_list = _tmp
-
+        print(f"\n  → 開度の R_open は各 k の有効半径（R_eff）を自動使用します。")
+        for k, R_eff in zip(k_list, r_eff_list):
+            print(f"     k={k} → R_open={R_eff:.1f}m")
         n_dirs = ask_int("開度の方向数 n_dirs（8 or 16 推奨）", 8)
-
         if openness_mode == 2:
             step_stride = ask_int(
                 "開度のサンプリング間隔（ピクセル, Python 内蔵のみ）"
-                "\n  1: 1,2,3,...ピクセルごと / 2: 2,4,6,... / 3: 3,6,9,...",
+                "\n  1: 毎ピクセル / 2: 2px刻み / 3: 3px刻み",
                 1,
             )
-            for r_open in openness_r_list:
-                n_px = max(1, int(round(float(r_open) / float(px))))
-                print(f"    - R_open={r_open}m → 1〜{n_px}px（step_stride={step_stride}）")
-        elif openness_mode == 1:
-            for r_open in openness_r_list:
-                n_px = max(1, int(round(float(r_open) / float(px))))
-                print(f"    - R_open={r_open}m → 1〜{n_px}px（n_dirs={n_dirs}）")
-
-        for r_open in openness_r_list:
-            win_pix_open = _winpix_from_meters(r_open, px, min_win=1, odd=True)
-            mask_win_candidates.append(win_pix_open)
-
-    if openness_mode == 2:
-        total_px = h * w
-        if total_px > 50_000_000:
-            print(
-                f"\n---注意--- DEM の総ピクセル数は約 {total_px/1e6:.1f} 百万ピクセルです。"
-                "\n       Python 内蔵の開度計算は非常に時間がかかる可能性があります。"
-            )
+            total_px = h * w
+            if total_px > 50_000_000:
+                print(
+                    f"\n---注意--- DEM の総ピクセル数は約 {total_px/1e6:.1f} 百万ピクセルです。"
+                    "\n       Python 内蔵の開度計算は非常に時間がかかる可能性があります。"
+                )
 
     # 外縁マスク窓（全指標で共通）
     if mask_win_candidates:

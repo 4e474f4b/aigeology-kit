@@ -437,19 +437,30 @@ def openness_pair(dem, px, r_open, n_dirs=8, step_stride=1):
 
 # =============== SAGA 開度 ===============
 
+_GFLAGS_ERROR = "flag 'help' was defined more than once"
+
+
 def confirm_saga_openness_tool(saga_cmd_path, tool_id=5):
     try:
         result = subprocess.run(
             [saga_cmd_path, "ta_lighting", "--help"],
             capture_output=True, text=True, timeout=15,
         )
-        if str(tool_id) in result.stdout + result.stderr:
+        output = result.stdout + result.stderr
+        if _GFLAGS_ERROR in output:
+            print(f"  [WARN] SAGA の gflags 競合エラーを検出しました → Python 内蔵モードに切り替えます。")
+            return False
+        if str(tool_id) in output or "Topographic Openness" in output:
             return True
         result2 = subprocess.run(
             [saga_cmd_path, "ta_lighting"],
             capture_output=True, text=True, timeout=15,
         )
-        print(result2.stdout[:2000])
+        out2 = result2.stdout + result2.stderr
+        if _GFLAGS_ERROR in out2:
+            print(f"  [WARN] SAGA の gflags 競合エラーを検出しました → Python 内蔵モードに切り替えます。")
+            return False
+        print(out2[:2000])
         return True
     except Exception as e:
         print(f"  SAGA 確認中にエラー: {e}")
