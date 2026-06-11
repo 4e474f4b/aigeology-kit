@@ -3706,22 +3706,24 @@ def predict_mode():
 
     # =====================================================
     # 予測結果の保存先を「最初に」決めておく
-    # 学習モードと同様に predict_{run_id}/ サブフォルダを自動作成
     # =====================================================
     in_stem = Path(in_path).stem
     in_parent = Path(in_path).parent
-    out_dir = in_parent / f"predict_{run_id}"
-    out_dir.mkdir(parents=True, exist_ok=True)
 
+    # デフォルト出力ファイル名（拡張子はin_pathに合わせる）
     low_in = in_path.lower()
     if low_in.endswith(".csv"):
-        default_out_path = str(out_dir / f"{in_stem}_pred_table_{run_id}.csv")
+        default_filename = f"{in_stem}_pred_{run_id}_plain.csv"
     elif low_in.endswith(".parquet") or low_in.endswith(".pq"):
-        default_out_path = str(out_dir / f"{in_stem}_pred_{run_id}_plain.parquet")
+        default_filename = f"{in_stem}_pred_{run_id}_plain.parquet"
     elif low_in.endswith(".gpkg"):
-        default_out_path = str(out_dir / f"{in_stem}_pred_table_{run_id}.gpkg")
+        default_filename = f"{in_stem}_pred_{run_id}_plain.gpkg"
     else:
-        default_out_path = str(out_dir / f"{in_stem}_pred_table_{run_id}.csv")
+        default_filename = f"{in_stem}_pred_{run_id}_plain.csv"
+
+    # デフォルトの出力先フォルダ（まだ作成しない）
+    default_out_dir = in_parent / f"predict_{run_id}"
+    default_out_path = str(default_out_dir / default_filename)
 
     print("\n[出力先の設定]")
     print(f"  デフォルト: {default_out_path}")
@@ -3729,19 +3731,21 @@ def predict_mode():
         "予測結果の保存先パス（空=上記デフォルト。拡張子を含めて指定可。"
         "ディレクトリのみ指定した場合は、その中にデフォルト名で保存）: "
     ).strip().strip('"').strip("'")
+
     if not out_path:
+        # デフォルト: ここで初めてフォルダを作成
+        out_dir = default_out_dir
         out_path = default_out_path
     else:
         p = Path(out_path)
         if p.is_dir() or out_path.endswith(("/", "\\")):
-            out_dir = Path(out_path)
-            out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = str(out_dir / Path(default_out_path).name)
+            out_dir = p
+            out_path = str(out_dir / default_filename)
             print(f"  → ディレクトリ指定と判断し、{out_path} に保存します。")
         else:
-            # 明示的にパスを指定した場合はそのディレクトリを out_dir にする
             out_dir = Path(out_path).parent
-            out_dir.mkdir(parents=True, exist_ok=True)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
     print(f"  → 予測結果は {out_path} に保存されます。")
     undersample_csv_path = out_dir / f"rf_undersample_info_{run_id}.csv"
 
