@@ -534,11 +534,15 @@ def openness_pair(dem, px: float, r_open: float, n_dirs: int = 8, step_stride: i
 
 # =============== SAGA を用いた開度 ===============
 
+_GFLAGS_ERROR = "flag 'help' was defined more than once"
+
+
 def confirm_saga_openness_tool(saga_cmd_path: str, tool_id: int = 5) -> bool:
     """
     saga_cmd ta_lighting -h で 5: Topographic Openness の存在を確認。
-    SAGA 側の「[Error] select a tool」は単なるヘルプ終了メッセージなので、
+    SAGA 側の「[Error] select a tool」は単なるヘルプ終了メッセージなので
     コンソールには出さないようにフィルタする。
+    gflags 競合エラーを検出した場合は False を返す。
     """
     print("\n=== SAGA ta_lighting モジュールの一覧を確認します... ===")
     try:
@@ -550,6 +554,10 @@ def confirm_saga_openness_tool(saga_cmd_path: str, tool_id: int = 5) -> bool:
             check=False,
         )
         out = proc.stdout or ""
+
+        if _GFLAGS_ERROR in out:
+            print("  [WARN] SAGA の gflags 競合エラーを検出しました → Python 内蔵モードに切り替えます。")
+            return False
 
         # 紛らわしいだけのヘルプ終端メッセージを除去
         filtered_lines = []
