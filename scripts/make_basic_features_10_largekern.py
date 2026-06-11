@@ -114,6 +114,46 @@ def ask_float_list(prompt, default_list):
             print("  カンマ区切りの数値で入力してください（例: 10,20,30）。")
 
 
+def ask_k_list(prompt, default_list, px: float):
+    """
+    窓サイズ k（奇数・3以上）をカンマ区切りで受け取る。
+    偶数・2以下は拒否してエラーメッセージを表示する。
+    """
+    default_str = ",".join(str(v) for v in default_list)
+    while True:
+        s = input(f"{prompt} [{default_str}]: ").strip()
+        if not s:
+            return list(default_list)
+        try:
+            vals = [int(x.strip()) for x in s.split(",") if x.strip()]
+            if not vals:
+                raise ValueError
+        except ValueError:
+            print("  カンマ区切りの整数で入力してください（例: 3,5,7,9,15,31）。")
+            continue
+
+        errors = []
+        for v in vals:
+            if v < 3:
+                errors.append(f"  [ERROR] k={v} は最小値 3 を下回っています（3×3 が最小窓）。")
+            elif v % 2 == 0:
+                errors.append(f"  [ERROR] k={v} は偶数です。中心ピクセルが存在しないため使用できません。奇数を指定してください（例: {v+1}）。")
+        if errors:
+            for e in errors:
+                print(e)
+            continue
+
+        # 重複除去（順序維持）
+        seen = set()
+        unique = []
+        for v in vals:
+            if v not in seen:
+                seen.add(v)
+                unique.append(v)
+
+        return unique
+
+
 def _winpix_from_meters(r_m: float, px: float, *, min_win: int = 1, odd: bool = True) -> int:
     if not np.isfinite(r_m) or r_m <= 0:
         k = min_win
@@ -550,24 +590,28 @@ def main():
         openness_mode_raw = ask_int("番号を選んでください", 1)
         openness_mode = 2 if openness_mode_raw == 1 else 3
 
-    # スケール指定
-    print("\n[スケール指定（全10特徴量共通）]\n")
-    print("空間スケール R[m] を指定してください（カンマ区切り可）。")
-    print("  例) px=10m のとき R=30 → k=3(d=1), R=90 → k=9(d=4), R=300 → k=31(d=15)")
-    print("  比高・標準偏差・TPI・TRI・傾斜・方位・曲率・ラプラシアンすべて同一スケールで出力します。\n")
+    # スケール指定（窓サイズ直接入力）
+    print("\n[スケール指定（全10特徴量共通）]")
+    print(f"  ピクセルサイズ: {px:.3f} m")
+    print("  窓サイズ k（奇数・3以上）をカンマ区切りで指定してください。")
+    print("  ※ 偶数は中心ピクセルが存在しないため使用できません。")
+    print("  ※ 最小は k=3（3×3窓）です。")
+    print(f"  例) k=3（{3*px:.0f}m相当）, k=5（{5*px:.0f}m相当）, k=9（{9*px:.0f}m相当）, k=31（{31*px:.0f}m相当）\n")
 
-    relief_r_list = ask_float_list("R[m]（例: 30,50,90）", [30.0, 50.0, 90.0])
-    relief_r_in_list = list(relief_r_list)
-    k_list = _r_to_k_list(relief_r_in_list, px)
-    adopted_r_list = [float(k) * float(px) for k in k_list]
+    k_list = ask_k_list(
+        "窓サイズ k（例: 3,5,7,9,15,31）",
+        [3, 5, 7, 9, 15, 31],
+        px,
+    )
 
-    print("\n  → 入力Rに対して採用される実効R（=k×px）と差分距離 d:")
-    for Rin, k, Radopt in zip(relief_r_in_list, k_list, adopted_r_list):
+    print("\n  → 指定窓サイズと差分距離 d:")
+    for k in k_list:
         d = max(1, (k - 1) // 2)
-        print(f"    R_in={Rin:.3f} m → k={k}（{k}×{k}窓） → R_adopt={Radopt:.3f} m, d={d}px（{d*px:.1f}m）")
+        R_eff = d * px
+        print(f"    k={k}（{k}×{k}窓）  d={d}px  有効半径≒{R_eff:.1f}m  カバー範囲≒{k*px:.0f}m")
 
-    # 開度スケール（比高と同一スケールで自動設定）
-    print("  1: 外接円（正方形窓の外接円） R_open = √2 × R_eff")
+    # 開度スケール（k から R_open_match を自動算出）
+    print("\n  1: 外接円（正方形窓の外接円） R_open = √2 × R_eff")
     print("  2: 面積等価円（k×k窓と同面積） R_open = (2/√π) × R_eff")
     print("  3: 内接円（正方形窓の内接円） R_open = R_eff")
     match_mode = ask_int("番号を選んでください", 2)
@@ -584,16 +628,14 @@ def main():
 
     print(f"  → 採用方式: {mode_label}")
 
-    win_pix_list   = []
-    r_eff_list     = []
+    win_pix_list      = []
+    r_eff_list        = []
     r_open_match_list = []
-    for Rin, k in zip(relief_r_in_list, k_list):
+    for k in k_list:
         win_pix_list.append(k)
         R_eff = ((k - 1) / 2.0) * px
         r_eff_list.append(R_eff)
-        R_open_match = coeff * R_eff
-        r_open_match_list.append(R_open_match)
-        print(f"  R_in={Rin:.3f}m → k={k}, R_eff≒{R_eff:.3f}m, R_open_match≒{R_open_match:.3f}m")
+        r_open_match_list.append(coeff * R_eff)
 
     mask_win_candidates = list(win_pix_list)
 
@@ -605,8 +647,8 @@ def main():
     if openness_mode != 3:
         default_open_list = [float(f"{v:.3f}") for v in r_open_match_list]
         info_pairs = ", ".join(
-            f"R={R:.3g}m→R_open_match≒{Ropen:.3g}m"
-            for R, Ropen in zip(relief_r_list, r_open_match_list)
+            f"k={k}→R_open_match≒{Ropen:.3g}m"
+            for k, Ropen in zip(k_list, r_open_match_list)
         )
         openness_r_list = ask_float_list(
             "開度の最大距離 R_open[m]（カンマ区切り可, Enterで比高と同スケール推奨値）"
@@ -669,12 +711,12 @@ def main():
     # ─────────────────────────────────────────────────────────────
     # マルチスケールループ：全 10 特徴量を同一スケールで計算
     # ─────────────────────────────────────────────────────────────
-    for Rin, win_pix in zip(relief_r_in_list, k_list):
+    for win_pix in k_list:
         R_eff = ((win_pix - 1) / 2.0) * px
         d = max(1, (win_pix - 1) // 2)
-        tag = f"rin{int(round(Rin))}m_k{win_pix}_reff{int(round(R_eff))}m"
+        tag = f"k{win_pix}_reff{int(round(R_eff))}m"
 
-        print(f"\n  > スケール R={Rin:.3g}m, k={win_pix}, d={d}px ...")
+        print(f"\n  > k={win_pix}（{win_pix}×{win_pix}窓）, d={d}px（{d*px:.1f}m）...")
 
         # 比高・標準偏差
         rel = local_relief(dem, win_pix)
